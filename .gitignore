@@ -1,0 +1,7 @@
+.zig-cache/
+zig-out/
+# trained checkpoints: the shipped tiny model is committed, ad-hoc runs are not
+models/*.vzm
+!models/tiny.vzm
+*.log
+.DS_Store

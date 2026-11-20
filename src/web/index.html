@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vibezig/llm</title>
+<style>
+  :root {
+    --bg: #0a0c10;
+    --panel: #11151c;
+    --panel-2: #161b24;
+    --line: #232a36;
+    --text: #e6edf3;
+    --muted: #8b98a9;
+    --accent: #7cf3a0;
+    --accent-2: #7aa2f7;
+    --danger: #f77a7a;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background:
+      radial-gradient(900px 500px at 15% -10%, #12261d 0%, transparent 60%),
+      radial-gradient(700px 400px at 95% 0%, #131c2e 0%, transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 18px 28px; border-bottom: 1px solid var(--line);
+    background: color-mix(in srgb, var(--panel) 75%, transparent);
+    backdrop-filter: blur(6px);
+  }
+  .logo { font-size: 17px; font-weight: 600; letter-spacing: -0.2px; }
+  .logo .slash { color: var(--muted); }
+  .logo .dot { color: var(--accent); }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+  .chip {
+    font-size: 11px; color: var(--muted); border: 1px solid var(--line);
+    background: var(--panel-2); border-radius: 999px; padding: 4px 10px;
+  }
+  .chip b { color: var(--text); font-weight: 500; }
+  main {
+    flex: 1; width: 100%; max-width: 1180px; margin: 0 auto;
+    padding: 22px 24px 32px; display: grid; gap: 16px;
+    grid-template-columns: minmax(0, 1fr) 280px;
+    grid-template-areas: "prompt side" "output side";
+    align-items: start;
+  }
+  .area-prompt { grid-area: prompt; }
+  .area-output { grid-area: output; }
+  .area-side { grid-area: side; }
+  @media (max-width: 820px) {
+    main {
+      grid-template-columns: 1fr;
+      grid-template-areas: "prompt" "output" "side";
+    }
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 16px; min-width: 0;
+  }
+  .card h2 {
+    margin: 0 0 12px; font-size: 11px; letter-spacing: 1.4px;
+    text-transform: uppercase; color: var(--muted); font-weight: 500;
+  }
+  textarea {
+    width: 100%; min-height: 96px; resize: vertical;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+    font-family: var(--mono); font-size: 13px; line-height: 1.5;
+    outline: none;
+  }
+  textarea:focus { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+  .row { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+  button {
+    font-family: var(--mono); font-size: 13px; font-weight: 600;
+    border-radius: 9px; border: 1px solid transparent; padding: 9px 16px;
+    cursor: pointer; transition: transform .06s ease, filter .15s ease;
+  }
+  button:active { transform: translateY(1px); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .primary { background: var(--accent); color: #06210f; }
+  .primary:hover:not(:disabled) { filter: brightness(1.08); }
+  .ghost { background: transparent; color: var(--muted); border-color: var(--line); }
+  .ghost:hover { color: var(--text); border-color: var(--muted); }
+  .spacer { flex: 1; }
+  .stat { font-size: 11px; color: var(--muted); }
+  .stat b { color: var(--text); font-weight: 500; }
+  #out {
+    white-space: pre-wrap; word-break: break-word;
+    font-size: 13.5px; line-height: 1.65; min-height: 340px;
+    color: #d5e2ec;
+  }
+  #out .prompt { color: var(--accent-2); }
+  #out .rest { color: #d5e2ec; }
+  .caret {
+    display: inline-block; width: 8px; height: 15px; vertical-align: -2px;
+    background: var(--accent); margin-left: 2px; animation: blink 1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .controls { display: grid; gap: 14px; }
+  label { font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; }
+  label b { color: var(--text); font-weight: 500; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .hint { font-size: 11px; color: var(--muted); line-height: 1.6; }
+  .kbd {
+    border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px;
+    padding: 1px 5px; background: var(--panel-2); font-size: 10px; color: var(--text);
+  }
+  .err { color: var(--danger); }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">vibezig<span class="slash">/</span>llm<span class="dot">.</span></div>
+  <div class="chips" id="chips"><span class="chip">loading model…</span></div>
+</header>
+
+<main>
+  <section class="card area-prompt">
+    <h2>prompt</h2>
+    <textarea id="prompt" spellcheck="false">ROMEO:</textarea>
+    <div class="row">
+      <button class="primary" id="go">Generate</button>
+      <button class="ghost" id="stop" disabled>Stop</button>
+      <span class="spacer"></span>
+      <span class="stat" id="stat"></span>
+    </div>
+    <div class="row">
+      <span class="hint"><span class="kbd">Ctrl</span> + <span class="kbd">Enter</span> to generate</span>
+    </div>
+  </section>
+
+  <section class="card area-output">
+    <h2>output</h2>
+    <div id="out"><span class="rest">—</span></div>
+  </section>
+
+  <aside class="card controls area-side">
+    <h2>sampling</h2>
+    <div>
+      <label>tokens <b id="tokens-v">200</b></label>
+      <input type="range" id="tokens" min="16" max="600" step="8" value="200">
+    </div>
+    <div>
+      <label>temperature <b id="temp-v">0.80</b></label>
+      <input type="range" id="temp" min="0" max="1.6" step="0.05" value="0.8">
+    </div>
+    <div>
+      <label>top-k <b id="topk-v">40</b></label>
+      <input type="range" id="topk" min="0" max="120" step="1" value="40">
+    </div>
+    <div>
+      <label>seed <b id="seed-v">0</b></label>
+      <input type="range" id="seed" min="0" max="999" step="1" value="0">
+    </div>
+    <p class="hint">
+      Inference runs in Zig on this machine, one token at a time, over HTTP.
+      No Python, no CUDA, no dependencies.
+    </p>
+  </aside>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const out = $("out");
+let source = null;
+
+function setChips(info) {
+  const n = (v) => v >= 1e6 ? (v / 1e6).toFixed(2) + "M" : v >= 1e3 ? (v / 1e3).toFixed(1) + "k" : String(v);
+  $("chips").innerHTML = [
+    ["params", n(info.params)],
+    ["layers", info.layers],
+    ["heads", info.heads],
+    ["embd", info.embd],
+    ["block", info.block],
+    ["vocab", info.vocab],
+    ["format", info.format],
+  ].map(([k, v]) => `<span class="chip">${k} <b>${v}</b></span>`).join("");
+}
+
+fetch("/api/model").then(r => r.json()).then(setChips).catch(() => {
+  $("chips").innerHTML = `<span class="chip err">model unavailable</span>`;
+});
+
+for (const id of ["tokens", "temp", "topk", "seed"]) {
+  const el = $(id);
+  const label = $(id === "topk" ? "topk-v" : id + "-v");
+  const fmt = () => {
+    const v = parseFloat(el.value);
+    label.textContent = id === "temp" ? v.toFixed(2) : (id === "topk" && v === 0 ? "off" : String(v));
+  };
+  el.addEventListener("input", fmt);
+  fmt();
+}
+
+function stop() {
+  if (source) { source.close(); source = null; }
+  $("go").disabled = false;
+  $("stop").disabled = true;
+  const c = out.querySelector(".caret");
+  if (c) c.remove();
+}
+
+function generate() {
+  stop();
+  const prompt = $("prompt").value;
+  if (!prompt) return;
+  const q = new URLSearchParams({
+    prompt,
+    tokens: $("tokens").value,
+    temp: $("temp").value,
+    top_k: $("topk").value,
+    seed: $("seed").value,
+  });
+
+  out.innerHTML = "";
+  const pre = document.createElement("span");
+  pre.className = "prompt";
+  pre.textContent = prompt;
+  const body = document.createElement("span");
+  body.className = "rest";
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  out.append(pre, body, caret);
+  if (prompt.endsWith("\n")) out.insertBefore(document.createElement("br"), body);
+
+  $("go").disabled = true;
+  $("stop").disabled = false;
+  $("stat").textContent = "";
+
+  const started = performance.now();
+  const decoder = new TextDecoder("utf-8");
+  let count = 0;
+  source = new EventSource("/api/stream?" + q.toString());
+  source.onmessage = (ev) => {
+    const d = JSON.parse(ev.data);
+    if (d.event === "done") {
+      const secs = (performance.now() - started) / 1000;
+      $("stat").innerHTML = `<b>${count}</b> tokens · <b>${(count / Math.max(secs, 0.001)).toFixed(1)}</b> tok/s · <b>${secs.toFixed(2)}</b>s`;
+      stop();
+      return;
+    }
+    if (d.event === "error") {
+      body.insertAdjacentText("beforeend", "");
+      $("stat").innerHTML = `<span class="err">error: ${d.error}</span>`;
+      stop();
+      return;
+    }
+    if (typeof d.b === "number") {
+      // tokens are bytes: decode as a stream so UTF-8 sequences survive
+      body.textContent += decoder.decode(new Uint8Array([d.b]), { stream: true });
+      count++;
+      caret.remove();
+      out.append(caret);
+    }
+  };
+  source.onerror = () => {
+    if (count === 0) $("stat").innerHTML = `<span class="err">stream closed</span>`;
+    stop();
+  };
+}
+
+$("go").addEventListener("click", generate);
+$("stop").addEventListener("click", stop);
+$("prompt").addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); generate(); }
+});
+</script>
+</body>
+</html>

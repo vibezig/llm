@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: unit tests
+        run: zig build test --summary all
+      - name: release build
+        run: zig build --release=fast
+      - name: smoke test (gen -> train 5 steps -> infer)
+        run: |
+          ./zig-out/bin/llm gen --out /tmp/smoke.vzm
+          ./zig-out/bin/llm train --model /tmp/smoke.vzm --steps 5 --eval-every 0 --sample-every 0 --out /tmp/smoke.vzm
+          ./zig-out/bin/llm infer --model /tmp/smoke.vzm --prompt "A" --tokens 8
+          ./zig-out/bin/llm info --model /tmp/smoke.vzm
