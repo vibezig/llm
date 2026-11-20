@@ -273,7 +273,7 @@ fn jsonFloat(v: std.json.Value) ?f64 {
     };
 }
 
-/// Chat prompt template: `role: content\n` per message, then `assistant:`.
+/// Chat prompt template: the last user turn as a raw `Q: ...\nA:` pair.
 /// A byte-level model has no chat format of its own, so this is the contract.
 fn buildPrompt(arena: std.mem.Allocator, p: *const Params, mode: Mode) ![]const u8 {
     if (mode == .text) {
@@ -284,15 +284,13 @@ fn buildPrompt(arena: std.mem.Allocator, p: *const Params, mode: Mode) ![]const 
         if (p.prompt.len > 0) return p.prompt;
         return error.EmptyPrompt;
     }
-    var list: std.ArrayList(u8) = .empty;
+
+    var last_user: ?Msg = null;
     for (p.messages) |m| {
-        try list.appendSlice(arena, m.role);
-        try list.appendSlice(arena, ": ");
-        try list.appendSlice(arena, m.content);
-        try list.append(arena, '\n');
+        if (std.mem.eql(u8, m.role, "user")) last_user = m;
     }
-    try list.appendSlice(arena, "assistant:");
-    return list.items;
+    const content = if (last_user) |m| m.content else p.messages[p.messages.len - 1].content;
+    return std.fmt.allocPrint(arena, "Q: {s}\nA:", .{content});
 }
 
 fn fullCompletion(self: Conn, req: *std.http.Server.Request, mode: Mode, params: *const Params, prompt_ids: []const u32) !void {
@@ -312,6 +310,12 @@ fn fullCompletion(self: Conn, req: *std.http.Server.Request, mode: Mode, params:
     const text = try utf8Lossy(self.gpa, raw);
     defer self.gpa.free(text);
 
+    // QA answers stop at the first newline; ignore the next question.
+    var answer = text;
+    if (mode == .chat) {
+        if (std.mem.indexOfScalar(u8, text, '\n')) |nl| answer = text[0..nl];
+    }
+
     const created = nowSeconds(self.io);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(self.gpa);
@@ -323,13 +327,13 @@ fn fullCompletion(self: Conn, req: *std.http.Server.Request, mode: Mode, params:
         try out.print(self.gpa, "{{\"id\":\"chatcmpl-{d}\",\"object\":\"chat.completion\",\"created\":{d},\"model\":", .{ created, created });
         try appendJsonString(&out, self.gpa, params.model);
         try out.appendSlice(self.gpa, ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
-        try appendJsonString(&out, self.gpa, text);
+        try appendJsonString(&out, self.gpa, answer);
         try out.appendSlice(self.gpa, "},\"logprobs\":null,\"finish_reason\":\"length\"}],\"usage\":");
     } else {
         try out.print(self.gpa, "{{\"id\":\"cmpl-{d}\",\"object\":\"text_completion\",\"created\":{d},\"model\":", .{ created, created });
         try appendJsonString(&out, self.gpa, params.model);
         try out.appendSlice(self.gpa, ",\"choices\":[{\"index\":0,\"text\":");
-        try appendJsonString(&out, self.gpa, text);
+        try appendJsonString(&out, self.gpa, answer);
         try out.appendSlice(self.gpa, ",\"logprobs\":null,\"finish_reason\":\"length\"}],\"usage\":");
     }
     try out.print(self.gpa, "{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}", .{ p, c, p + c });
@@ -358,7 +362,7 @@ fn streamCompletion(self: Conn, req: *std.http.Server.Request, mode: Mode, param
     var sse = SseOut.init(w, params.model, mode, nowSeconds(self.io));
     try sse.emitRole();
 
-    var ctx = StreamCtx{ .sse = &sse, .tokenizer = &self.model.tokenizer };
+    var ctx = StreamCtx{ .sse = &sse, .tokenizer = &self.model.tokenizer, .stop_at_newline = mode == .chat };
     const sink = gpt.TokenSink{ .ctx = @ptrCast(&ctx), .emit = &StreamCtx.emit };
 
     var ids: std.ArrayList(u32) = .empty;
@@ -414,13 +418,12 @@ const SseOut = struct {
 
     fn emitContent(self: *SseOut, bytes: []const u8) !void {
         try self.head("content");
-        if (self.chat) try self.w.writeAll("{\"content\":") else try self.w.writeAll("\"");
         if (self.chat) {
+            try self.w.writeAll("{\"content\":");
             try writeJsonEscaped(self.w, bytes);
             try self.w.writeAll("}");
         } else {
             try writeJsonEscaped(self.w, bytes);
-            try self.w.writeAll("\"");
         }
         try self.w.writeAll(",\"logprobs\":null,\"finish_reason\":null}]}\n\n");
         try self.w.flush();
@@ -449,12 +452,15 @@ const SseOut = struct {
 const StreamCtx = struct {
     sse: *SseOut,
     tokenizer: *const tokenizer.Tokenizer,
+    stop_at_newline: bool,
     pending: [4]u8 = undefined,
     len: u8 = 0,
     need: u8 = 0,
+    stopped: bool = false,
 
     fn emit(ctx: *anyopaque, token: u32) void {
         const self: *StreamCtx = @ptrCast(@alignCast(ctx));
+        if (self.stopped) return;
         var buf: [tokenizer.max_token_bytes]u8 = undefined;
         const bytes = self.tokenizer.decodeTokenInto(token, &buf) catch {
             self.sse.emitContent("\xEF\xBF\xBD") catch {};
@@ -462,6 +468,11 @@ const StreamCtx = struct {
         };
         var out: [4]u8 = undefined;
         for (bytes) |b| {
+            // QA chat answers stop at the first newline; text completion does not.
+            if (self.stop_at_newline and b == '\n') {
+                self.stopped = true;
+                return;
+            }
             if (self.feed(b, &out)) |seq| self.sse.emitContent(seq) catch {};
         }
     }
@@ -628,6 +639,5 @@ test "buildPrompt renders the chat template" {
     const msgs = [_]Msg{.{ .role = "user", .content = "hi" }};
     var p = Params{ .messages = &msgs };
     const out = try buildPrompt(arena.allocator(), &p, .chat);
-    try std.testing.expect(std.mem.startsWith(u8, out, "user: hi"));
-    try std.testing.expect(std.mem.endsWith(u8, out, "assistant:"));
+    try std.testing.expectEqualStrings("Q: hi\nA:", out);
 }

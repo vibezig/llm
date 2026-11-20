@@ -59,7 +59,7 @@ fn printHelp(out: *std.Io.Writer) !void {
         \\  llm train [--data data/input.txt] [--out models/tiny.vzm] [--model in.vzm]
         \\            [--vocab 1024] [--heads 4] [--kv-heads 2] [--steps 3000]
         \\            [--batch 8] [--lr 0.003] [--wd 0.01]
-        \\            [--eval-every 100] [--sample-every 250] [--seed 1337]
+        \\            [--eval-every 100] [--sample-every 250] [--val-fraction 0.05] [--seed 1337]
         \\  llm infer [--model models/tiny.vzm] [--prompt "ROMEO:"] [--tokens 200]
         \\            [--temp 0.8] [--top-k 40] [--seed 0]
         \\  llm serve [--model models/tiny.vzm] [--port 8080]
@@ -88,7 +88,7 @@ fn cmdGen(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Writer)
     };
     defer gpa.free(corpus);
 
-    const blob = try tokenizer.train(gpa, corpus[0 .. corpus.len - corpus.len / 20], vocab_size);
+    const blob = try tokenizer.train(gpa, corpus, vocab_size);
     defer gpa.free(blob);
 
     var tk = try tokenizer.Tokenizer.initBpeFromBlob(gpa, blob);
@@ -138,6 +138,7 @@ fn cmdTrain(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Write
     const eval_every = flags.getInt(usize, "eval-every", 100);
     const sample_every = flags.getInt(usize, "sample-every", 250);
     const seed = flags.getInt(u64, "seed", 1337);
+    const val_fraction = flags.getFloat(f32, "val-fraction", 0.05);
 
     const corpus = std.Io.Dir.cwd().readFileAlloc(io, data_path, gpa, .limited(64 << 20)) catch |e| {
         try err.print("cannot read corpus '{s}': {t}\n", .{ data_path, e });
@@ -146,8 +147,9 @@ fn cmdTrain(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Write
     defer gpa.free(corpus);
     if (corpus.len < 1024) return error.CorpusTooSmall;
 
-    // 95% train / 5% validation
-    const split = corpus.len - corpus.len / 20;
+    // Configurable train/validation split (default 95/5).
+    const val_bytes: usize = @intFromFloat(@as(f64, @floatFromInt(corpus.len)) * @as(f64, @max(val_fraction, 0.0)));
+    const split = corpus.len - @min(val_bytes, corpus.len);
     const train_text = corpus[0..split];
     const val_text = corpus[split..];
 
@@ -180,7 +182,7 @@ fn cmdTrain(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Write
     defer gpa.free(train_ids);
     const val_ids = try tk.encode(gpa, val_text);
     defer gpa.free(val_ids);
-    if (train_ids.len < T + 1 or val_ids.len < T + 1) return error.CorpusTooSmall;
+    if (train_ids.len < T + 1) return error.CorpusTooSmall;
 
     const s = try gpt.Session.init(gpa, &m, batch);
     defer s.deinit();
