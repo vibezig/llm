@@ -1,11 +1,12 @@
 # vibezig/llm
 
-A **fullstack LLM engine written in Zig**: tensor library, transformer training
-from scratch, inference, and an HTTP server with a web chat UI — all in one
-5 MB static binary with **zero dependencies**.
+A **fullstack LLM engine written in Zig**: transformer training from scratch,
+inference, and an HTTP server with a web chat UI — all in one static binary.
 
-No PyTorch. No Python. No GPU. The model is trained and served by the same Zig
-code that defines it.
+The tensor math, autograd and AdamW come from [Fucina](https://github.com/matteo-grella/fucina),
+a CPU-first tensor/autograd runtime fetched by the Zig build. No PyTorch. No
+Python. No GPU. The model is trained and served by the same Zig code that
+defines it.
 
 ```
 $ llm train --steps 12000        # learn Shakespeare from characters up
@@ -37,23 +38,24 @@ not the meaning of it.
 
 | layer | file | what it does |
 | --- | --- | --- |
-| tensor math | `src/tensor.zig` | f32 buffers, 4×8 blocked GEMM, layernorm, GELU, softmax, cross-entropy |
+| tensor math | `fucina` 0.5.1 | tagged f32 tensors, CPU SIMD kernels, eager autograd, AdamW |
 | checkpoint format | `src/model.zig` | config + tensor registry + weights in one flat blob (`.vzm`) |
 | tokenizer | `src/tokenizer.zig` | byte-level char tokenizer, vocab travels with the model |
-| transformer | `src/gpt.zig` | forward, hand-written backward, AdamW, sampling |
+| transformer | `src/gpt.zig` | block wiring, KV-cached sampling; forward/backward by Fucina |
 | CLI | `src/main.zig` | `gen` / `train` / `infer` / `info` / `serve` |
 | server | `src/server.zig` | HTTP/1.1 API + embedded UI (SSE token stream) |
 | web UI | `src/web/index.html` | single-file chat client, compiled into the binary |
 
 ## Quickstart
 
-Requires **Zig 0.17.1** (nothing else).
+Requires **Zig 0.16.0**. The first build fetches Fucina 0.5.1 (MIT) from
+`build.zig.zon`; there are no system libraries to install.
 
 ```bash
 git clone https://github.com/vibezig/llm && cd llm
 
 zig build --release=fast        # build zig-out/bin/llm
-zig build test                  # 24 tests, incl. finite-difference gradient checks
+zig build test                  # 18 tests, incl. finite-difference gradient checks
 
 ./zig-out/bin/llm gen           # create random tensors -> models/tiny.vzm
 ./zig-out/bin/llm train         # train on data/input.txt (TinyShakespeare)
@@ -131,23 +133,21 @@ vocab → **345,504 parameters** (1.4 MB). Bigger shapes are one flag away:
 ./zig-out/bin/llm train --model models/medium.vzm --steps 20000 --batch 16
 ```
 
-### Backprop is written out by hand
+### Autograd, not a hand-written tape
 
-There is no autograd tape. `Session.fwdBwd` keeps an explicit activation cache
-(per-layer norm statistics, q/k/v, attention probabilities, GELU inputs) and
-chains the analytic gradients through it, including:
+`Session` states the forward pass with Fucina's tagged tensors and lets
+`loss.backward()` walk the recorded graph; AdamW updates the parameter leaves.
+Every parameter is a Fucina `variable` that borrows its slice of the `.vzm`
+blob **in place**, so the optimizer writes straight into the checkpoint blob
+and `model.save()` needs no copy-back.
 
-* the softmax Jacobian inside scaled dot-product attention, with the causal mask,
-* layernorm backward with the mean/variance correction terms,
-* weight-tied gradients (the embedding matrix receives both the lookup and the
-  output-projection contribution),
-* residual additions folded into a single `dx`.
-
-That is easy to get subtly wrong, so the test suite checks every gradient bucket
-(embedding, attention, MLP, layernorm) against central finite differences:
+The wiring is guarded by central finite differences on seven gradient buckets
+(embeddings, attention, MLP, layernorm), and cached decoding is checked
+token-for-token against a full forward pass:
 
 ```
 test "gradients match finite differences" ... OK
+test "cached decoding matches a full forward pass (greedy)" ... OK
 ```
 
 Training loop: AdamW (β₁=0.9, β₂=0.99), decoupled weight decay 0.01, global
@@ -156,8 +156,9 @@ LR, and a 95/5 train/validation split of the corpus.
 
 ## Checkpoint format (`.vzm`)
 
-One flat `f32` blob plus a named registry, so parameters, gradients and optimizer
-state all share offsets — `grad[i]` always belongs to `param[i]`.
+One flat `f32` blob plus a named registry. Fucina variables borrow their slices
+in place, so the optimizer updates the checkpoint blob directly; gradients and
+Adam moments live in Fucina's per-parameter state.
 
 | field | type | notes |
 | --- | --- | --- |
@@ -227,33 +228,33 @@ console.log(r.choices[0].message.content);'
 
 ## Performance
 
-Measured on a 2 vCPU ARM (Graviton) box, single-threaded, `--release=fast`, no
-SIMD intrinsics beyond what Zig/LLVM vectorises:
+Measured on an Intel i5-13400 (16 threads), `--release=fast`, Fucina CPU
+kernels:
 
 | workload | throughput |
 | --- | --- |
-| training (345k params, batch 8 × seq 64) | 1,906 tok/s (~1.1 GFLOP/step) |
-| inference, short context | ~650 tok/s |
-| inference, 200 tokens of context | ~160 tok/s (full recompute, no KV cache) |
+| training (345k params, batch 8 × seq 64) | ~22,200 tok/s |
+| inference, KV cache, 200-token context | ~11,900 tok/s |
 
-That checkpoint is 12,000 steps = 6.1M tokens ≈ 5.5 epochs in **54 minutes**
-(same box): train loss 4.20 → 1.35, held-out val loss **1.78**.
+For reference, the hand-written kernels this replaced measured ~4,900 tok/s
+training and ~5,600 tok/s inference on the same machine. The loss trajectory is
+unchanged: both reach 2.53 after 200 smoke-test steps from the same seed.
 
-The GEMM kernels are 4×8 register-blocked: four rows of `A` share one vector of
-`B`, which cuts `B` traffic 4× and keeps the FMA loop in registers. That alone
-was worth ~1.7× over the naive axpy loop. `matmulTnAcc` (used for the six weight
-gradients per layer) uses the same blocking against activation rows.
+The same 12,000-step recipe on the 1 MB corpus reaches train loss 4.20 → 1.35
+and held-out val loss 1.78; wall-clock now depends on the host CPU and the BLAS
+provider Fucina auto-detects (`-Dblas=openblas` / `mkl` / `blis` are used when
+installed).
 
 ## Limits (on purpose)
 
 This is a readable reference implementation, not a production inference stack:
 
 * **char-level tokenizer** — one token per byte; no BPE yet.
-* **no KV cache** — generation re-runs the whole context each step, O(T²) per token.
-* **single-threaded** — no thread pool over row blocks yet.
 * **f32 only** — no quantisation, no bf16/f16.
 * **one request at a time** — the server serialises generations behind the model.
-* **CPU only** — no CUDA/Metal backend.
+* **CPU only** — Fucina's Metal/CUDA GEMM offload is not enabled here.
+* **pinned toolchain** — Fucina 0.5.1 requires Zig 0.16.0; a Zig upgrade waits
+  for upstream.
 
 Each of those is a contained piece of work; see `docs/ROADMAP.md`.
 
@@ -263,12 +264,17 @@ Each of those is a contained piece of work; see `docs/ROADMAP.md`.
 zig build test
 ```
 
-24 tests: GEMM vs naive reference, layernorm statistics and backward vs finite
-differences, softmax/CE gradients, `.vzm` round-trip and corruption rejection,
-full-model gradient checks, backward determinism (scratch-buffer leaks), "one
-AdamW step reduces loss", sampling length/range, query decoding and JSON
-escaping.
+18 tests: full-model gradients vs finite differences, backward determinism,
+"one AdamW step reduces loss", KV-cached decoding vs a full forward pass,
+sampling length/range, `.vzm` round-trip and corruption rejection, plus the CLI
+and server helpers.
 
 ## License
 
-MIT.
+MIT. See `LICENSE`.
+
+## Third-party
+
+[Fucina](https://github.com/matteo-grella/fucina) 0.5.1 is fetched by the Zig
+build and statically linked. It is MIT-licensed, copyright (c) 2026 Matteo
+Grella and the Fucina contributors; its license travels with the package.

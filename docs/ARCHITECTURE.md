@@ -1,129 +1,94 @@
 # Architecture notes
 
-Why the code looks the way it does, and the maths behind the backward pass.
+Why the code looks the way it does.
 
-## 1. One flat parameter blob
+## 1. One flat parameter blob, borrowed by Fucina
 
 `Model` owns `blob: []f32` plus a registry of `(name, offset, rows, cols)`.
 Offsets are assigned in a canonical order (`buildRegistry`), so:
 
-* gradients (`Session.grads`) and Adam moments (`OptState.m/v`) are allocated
-  with the same length and use the **same indices** — no per-tensor plumbing;
-* saving a checkpoint is a header plus one memcpy of the blob;
+* the `.vzm` checkpoint is still a header plus one memcpy of the blob;
 * the transformer hot path never does name lookups: `model.layout` resolves every
-  offset once at load time.
+  offset once at load time;
+* `Session` wraps each slice as a Fucina **variable borrowing that slice in
+  place** (`ctx.fromBorrowedSlice`), so the optimizer writes straight into the
+  checkpoint blob and `model.save()` needs no copy-back.
 
-Adding a tensor means adding it to `buildRegistry` and to `LayerOffsets`; the
+Gradients and Adam moments are Fucina-owned per-parameter state, so they no
+longer share the blob's layout. Adding a tensor means adding it to
+`buildRegistry`, to `LayerOffsets`, and to `Session.registerParams`; the
 registry test asserts offsets stay contiguous.
 
-## 2. Kernels
+`Session` is heap-allocated because Fucina pins an `ExecContext` after `init`
+(the embedded allocator points at itself) and the optimizer retains pointers to
+the parameter fields. Moving a `Session` value would invalidate both.
 
-Everything is row-major f32. The two GEMM shapes that matter:
+## 2. Kernels and autograd (Fucina)
 
-* `matmul(m,n,k,a,b,c)`: `c = a @ b` where `b` is input-major `[k,n]`. Used for
-  qkv projections, the MLP and the output projection.
-* `matmulNt(m,n,k,a,b,c)`: `c = a @ bᵀ` with `b` output-major `[n,k]`. Used for
-  the logits (`x @ wteᵀ`), for `dX = dY @ Wᵀ`, and for `dQ`/`dK`.
-* `matmulTnAcc(m,n,k,a,b,c)`: `c += aᵀ @ b` with `a` token-major `[k,m]`. Used for
-  every weight gradient (`dW = activationsᵀ @ dY`).
+All math is [Fucina](https://github.com/matteo-grella/fucina) 0.5.1: tagged f32
+tensors, CPU SIMD kernels, eager autograd, AdamW. There are no local tensor
+kernels in this repository.
 
-`matmul` and `matmulTnAcc` are 4×8 register-blocked: four independent rows share
-one `@Vector(8, f32)` load of `B`, so arithmetic intensity per `B` byte goes up
-4× and the FMA loop stays in registers. The tail rows/columns fall back to a
-plain axpy loop, which keeps the code correct for any shape (tests compare
-against the naive reference for `m,n,k` that are not multiples of 4/8).
+The model uses:
+
+* `.plain` matmul for `[rows, in] @ [in, out]` weights (qkv, MLP, output
+  projection), matching the `.vzm` row-major `[in, out]` layout;
+* `.trans_b` for the tied head: `[rows, embed] @ [vocab, embed]ᵀ`;
+* fused `layerNorm`, `gelu` and `crossEntropy` ops, each with its own VJP.
+
+Fucina selects a CBLAS provider at build time (`-Dblas=openblas|mkl|blis|nvpl`)
+and otherwise uses its portable Zig vector kernels. The dependency and its
+version are pinned in `build.zig.zon`.
 
 ## 3. Forward pass
 
-Rows are `(batch × time)` flattened: row `r = b*T + t`, so all per-token work is a
-2-D matmul. Attention needs to see individual heads, and each head occupies a
-contiguous `head_dim` slice inside the row, so the per-head loops read
-`q[r*C + h*hd ..][0..hd]` without a transpose.
-
-Per layer:
+Tokens and positions are gathered into a `[batch*seq, model]` stream (row
+`r = b*T + t`). Per layer:
 
 ```
-x  := LN1(x)            (save x, mean, rstd)
-q  := x @ Wq ; k := x @ Wk ; v := x @ Wv            (save q,k,v)
-for each (batch, head):
-    S[t,s] = (q_t · k_s) / sqrt(hd)   for s <= t      (causal)
-    P      = softmax(S)                                (save P)
-    O_t    = Σ_s P[t,s] · v_s                          (save O)
+x  := LN1(x)
+q  := x @ Wq ; k := x @ Wk ; v := x @ Wv
+O  := causalAttention(q, k, v)        # per batch row, all heads at once
 x  := x + O @ Wo
-y  := LN2(x)            (save x, mean, rstd)
-h  := GELU(y @ Wfc)     (save pre-GELU h and post-GELU h)
+y  := LN2(x)
+h  := GELU(y @ Wfc)
 x  := x + h @ Wproj
 ```
 
+Attention is the only place the batch axis is explicit: q/k/v are projected for
+all rows in one matmul, then each batch row is narrowed, split to
+`[seq, head, d]`, passed through Fucina's causal `groupedAttention`, and
+concatenated back along `.seq`. That keeps one weight read per projection while
+respecting per-sequence causality.
+
 The final `LN_f` and `logits = x @ wteᵀ` close the pass. The embedding matrix is
-tied: it is both the lookup table and the output projection.
+tied: it is both the lookup table and the output projection, and Fucina
+accumulates both gradient contributions into the same variable.
 
 ## 4. Backward pass
 
-Given `dl = ∂L/∂logits` from softmax cross-entropy (already scaled by `1/rows`):
+`loss.backward(ctx)` walks Fucina's recorded graph; every parameter leaf
+accumulates its gradient, `clipGradNorm` applies global clipping, `AdamW.step`
+updates the borrowed blob, and `zeroGrad` clears the leaves for the next step.
 
-```
-dlnf   = dl @ wte
-dwte  += dlᵀ @ lnf                       (output side of the tie)
-dx     = LayerNormBwd(dlnf, …)            # gradient into the last block
-```
+This repository no longer implements VJPs. It guards the model **wiring** with:
 
-then for each layer, from the top:
-
-```
-# MLP branch
-dh2    = dx @ Wprojᵀ
-dWproj+= hᵀ @ dx
-dh1    = GELU'(h_pre) ⊙ dh2
-dWfc  += yᵀ @ dh1
-dln2   = dh1 @ Wfcᵀ
-dx     = dx + LayerNormBwd(dln2, …)        # residual: gradients add
-
-# attention branch
-dO     = dx @ Woᵀ
-dWo   += Oᵀ @ dx
-for each (batch, head):
-    for t:  dV_s += P[t,s] · dO_t        for s <= t
-            dP_s  = dO_t · v_s
-    row_sum = Σ_s P[t,s] · dP_s
-    dS_s    = (dP_s − row_sum) · P[t,s]   # softmax Jacobian, diagonal form
-    dQ_t   += dS_s · k_s · scale
-    dK_s   += dS_s · q_t · scale
-dWq += xᵀ @ dQ ; dWk += xᵀ @ dK ; dWv += xᵀ @ dV
-dln1   = dQ @ Wqᵀ + dK @ Wkᵀ + dV @ Wvᵀ
-dx     = dx + LayerNormBwd(dln1, …)
-```
-
-Finally `dx` is scattered back into `dwte` (row per token id) and `dwpe` (row per
-position). The tied matrix therefore accumulates two contributions, which is why
-`dwte` is written with `+=` in both places.
-
-Layer norm backward uses the standard closed form:
-
-```
-xhat   = (x − μ) · rstd
-dg    += dy ⊙ xhat
-db    += dy
-dx    += rstd · (g⊙dy − mean(g⊙dy) − xhat · mean(g⊙dy ⊙ xhat))
-```
-
-Two invariants keep this honest:
-
-* **determinism** — every scratch buffer is zeroed before an accumulating kernel;
-  a test runs five identical backward passes and demands bit-identical gradients
-  (this caught a real bug: `dh2` used to accumulate across steps and the gradient
-  norm grew ~10⁸ within a dozen steps);
-* **numerical agreement** — a second test perturbs individual parameters of
-  embedding / attention / MLP / layernorm tensors and compares the analytic
-  gradient with central finite differences.
+* **numerical agreement** — perturb individual parameters of embedding /
+  attention / MLP / layernorm tensors and compare the analytic gradient with
+  central finite differences;
+* **determinism** — repeated forward/backward passes must reproduce the loss and
+  grad norm exactly;
+* **progress** — 20 AdamW steps must reduce the loss;
+* **decode parity** — KV-cached generation must match a full forward pass token
+  for token.
 
 ## 5. Sampling
 
-`generate` runs the model on the current context, applies temperature, keeps the
-top-k logits (sorted by score; k ≤ vocab so an O(V log V) sort is nothing), and
-samples from the renormalised distribution. The context slides once it hits
-`block_size`, dropping the oldest token — no KV cache yet, so each step is a full
-forward pass (see `docs/ROADMAP.md`).
+`generate` prefills the prompt one token at a time into a per-layer host K/V
+cache, then each new token costs a single-row forward over borrowed zero-copy
+cache views: O(T) attention per token instead of O(T²). When the context fills,
+the newest half is kept and replayed. Temperature scaling and top-k sampling are
+unchanged.
 
 ## 6. HTTP layer
 

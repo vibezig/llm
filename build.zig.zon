@@ -2,8 +2,13 @@
     .name = .llm,
     .version = "0.1.0",
     .fingerprint = 0x44c7d21843a555e2,
-    .minimum_zig_version = "0.17.1",
-    .dependencies = .{},
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .fucina = .{
+            .url = "git+https://github.com/matteo-grella/fucina?ref=v0.5.1#e7671113c71d2314331dacc2a715f630104a971b",
+            .hash = "fucina-0.5.1-BIpYfH0gswCUIMyAPepQSdt1hBkN02zDj3ixm4q-jge-",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

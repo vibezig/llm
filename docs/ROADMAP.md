@@ -5,20 +5,22 @@ CLI or the `.vzm` format except where noted.
 
 ## Inference speed
 
-1. **KV cache** — currently every generated token re-runs the full context
-   (O(T²) attention work per token). Caching K/V per layer per position makes
-   generation linear in context length and is the single biggest win: expect
-   5–20× at 200+ tokens of context. Touches `Session.forward` (skip the qkv
-   projection for already-seen positions) and the attention loop indexing.
-2. **Row-block threads** — `matmul` splits cleanly along `m`; a small pool over
-   `std.Thread` with no synchronisation (each thread owns its rows) gives close
-   to linear scaling on more cores.
-3. **Int8 / Q8_0 weights** — the blob is already a flat f32 array with a tensor
-   registry, so a second dtype in `.vzm` (`dtype = 1`) plus a dequantising GEMM
-   is a contained change. Meaningful size and speed win on ARM NEON.
-4. **AVX2/NEON-specific kernels** — replace `@Vector(8, f32)` blocks with
-   arch-dispatched intrinsics (`@import("builtin").cpu`) once profiling says the
-   generic kernel is the ceiling.
+Fucina already supplies the big three: a KV-cached decode path, a worker-team
+matmul, and arch-specific CPU kernels. What is left here is choosing and
+measuring the providers:
+
+1. **Benchmark BLAS providers** — Fucina auto-detects OpenBLAS/MKL/BLIS/NVPL
+   and falls back to its Zig kernels. Building with `-Dblas=...` and recording
+   per-shape numbers would tell us which provider to recommend for training vs
+   serving.
+2. **GPU GEMM offload** — Fucina can build with `-Dgpu=metal` (macOS) or
+   `-Dgpu=cuda` (Linux/NVIDIA) for large GEMMs. The model is tiny today, so the
+   work is mostly wiring the build flag and verifying parity.
+3. **Quantized weights** — Fucina has q8_0/q4_K block-quantized RHS kernels. A
+   second dtype in `.vzm` (`dtype = 1`) plus the loader would shrink the
+   checkpoint and speed up the memory-bound decode shapes.
+4. **Larger models** — the current 345k-parameter model fits in L2; the next
+   meaningful speed test is a model whose weights stream from RAM.
 
 ## Model quality
 
@@ -27,8 +29,9 @@ CLI or the `.vzm` format except where noted.
    equal parameter count this is worth far more than char-level.
 6. **Multi-file corpus loader** — walk a directory, concatenate with document
    separators, shuffle document order per epoch.
-7. **Checkpoint resume** — serialise AdamW moments (`opt.m`, `opt.v`, `t`) next
-   to the weights so a 12k-step run can be interrupted without a cold start.
+7. **Checkpoint resume** — Fucina's AdamW can `saveState`/`loadState`; persist
+   that next to the weights so a 12k-step run can be interrupted without a cold
+   start.
 8. **Dropout + faster LR schedules** — trivially useful once the model grows
    past ~10M parameters where overfitting starts to bite.
 

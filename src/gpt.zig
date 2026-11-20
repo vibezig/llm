@@ -1,36 +1,33 @@
-//! The transformer: forward pass, hand-written backward pass, AdamW, sampling.
+//! The transformer, now expressed on Fucina's eager autograd runtime.
 //!
-//! Architecture is GPT-2 small-shaped: pre-LN blocks, causal multi-head
-//! self-attention, GELU MLP with 4x expansion, learned position embeddings and
-//! a tied output head (`logits = x @ wte^T`).
+//! Architecture is unchanged: GPT-2 small-shaped, pre-LN blocks, causal
+//! multi-head self-attention, GELU MLP with 4x expansion, learned position
+//! embeddings and a tied output head (`logits = x @ wte^T`).
 //!
-//! Backprop is written by hand against an explicit activation cache instead of
-//! using an autograd tape: it keeps allocations predictable and makes the hot
-//! path readable. `gpt.test.gradients match finite differences` guards it.
+//! Every parameter is a Fucina `variable` that borrows its slice of
+//! `Model.blob` in place, so the `.vzm` checkpoint stays the single source of
+//! truth: the optimizer updates the blob directly and `Model.save` needs no
+//! copy-back. Forward, backward and AdamW are Fucina's; this file only states
+//! the block wiring.
 const std = @import("std");
-const tensor = @import("tensor.zig");
+const fucina = @import("fucina");
 const model_mod = @import("model.zig");
 const Model = model_mod.Model;
 
-pub const OptState = struct {
-    m: []f32,
-    v: []f32,
-    t: u32 = 0,
+const ExecContext = fucina.ExecContext;
+const optim = fucina.optim;
 
-    pub fn init(allocator: std.mem.Allocator, n: usize) !OptState {
-        const m = try allocator.alloc(f32, n);
-        errdefer allocator.free(m);
-        const v = try allocator.alloc(f32, n);
-        @memset(m, 0);
-        @memset(v, 0);
-        return .{ .m = m, .v = v };
-    }
+/// LayerNorm epsilon, matching the original local kernels.
+pub const eps: f32 = 1e-5;
 
-    pub fn deinit(self: *OptState, allocator: std.mem.Allocator) void {
-        allocator.free(self.m);
-        allocator.free(self.v);
-    }
-};
+const Emb = fucina.Tensor(.{ .vocab, .model });
+const PosEmb = fucina.Tensor(.{ .pos, .model });
+/// Any 2-D weight, stored [in, out] as in the `.vzm` registry.
+const Mat = fucina.Tensor(.{ .in, .out });
+const Norm = fucina.Tensor(.{.model});
+const Stream = fucina.Tensor(.{ .seq, .model });
+const AttnStream = fucina.Tensor(.{ .seq, .attn });
+const Logits = fucina.Tensor(.{ .seq, .vocab });
 
 pub const SampleParams = struct {
     temperature: f32 = 0.8,
@@ -42,7 +39,8 @@ pub const SampleParams = struct {
 ///
 /// K and V for already-seen positions never change, so decoding a new token only
 /// computes one row of q/k/v and attends over the cache: O(T) instead of O(T²)
-/// per token.
+/// per token. The cache is plain host memory; Fucina reads it through a
+/// borrowed zero-copy view.
 pub const KvCache = struct {
     k: [][]f32,
     v: [][]f32,
@@ -83,351 +81,398 @@ pub const TokenSink = struct {
     }
 };
 
+/// One transformer layer's trainable leaves, borrowed from the model blob.
+const LayerParams = struct {
+    ln1g: Norm,
+    ln1b: Norm,
+    wq: Mat,
+    wk: Mat,
+    wv: Mat,
+    wo: Mat,
+    ln2g: Norm,
+    ln2b: Norm,
+    fc: Mat,
+    proj: Mat,
+
+    fn init(ctx: *ExecContext, model: *const Model, l: usize) !LayerParams {
+        const cfg = model.cfg;
+        const c: usize = cfg.n_embd;
+        const m: usize = cfg.mlpDim();
+        const lo = model.layout.layers[l];
+        const b = model.blob;
+
+        var ln1g = try varFrom(Norm, ctx, .{c}, b, lo.ln1g, c);
+        errdefer ln1g.deinit();
+        var ln1b = try varFrom(Norm, ctx, .{c}, b, lo.ln1b, c);
+        errdefer ln1b.deinit();
+        var wq = try varFrom(Mat, ctx, .{ c, c }, b, lo.wq, c * c);
+        errdefer wq.deinit();
+        var wk = try varFrom(Mat, ctx, .{ c, c }, b, lo.wk, c * c);
+        errdefer wk.deinit();
+        var wv = try varFrom(Mat, ctx, .{ c, c }, b, lo.wv, c * c);
+        errdefer wv.deinit();
+        var wo = try varFrom(Mat, ctx, .{ c, c }, b, lo.wo, c * c);
+        errdefer wo.deinit();
+        var ln2g = try varFrom(Norm, ctx, .{c}, b, lo.ln2g, c);
+        errdefer ln2g.deinit();
+        var ln2b = try varFrom(Norm, ctx, .{c}, b, lo.ln2b, c);
+        errdefer ln2b.deinit();
+        var fc = try varFrom(Mat, ctx, .{ c, m }, b, lo.fc, c * m);
+        errdefer fc.deinit();
+        var proj = try varFrom(Mat, ctx, .{ m, c }, b, lo.proj, m * c);
+        errdefer proj.deinit();
+
+        return .{
+            .ln1g = ln1g,
+            .ln1b = ln1b,
+            .wq = wq,
+            .wk = wk,
+            .wv = wv,
+            .wo = wo,
+            .ln2g = ln2g,
+            .ln2b = ln2b,
+            .fc = fc,
+            .proj = proj,
+        };
+    }
+
+    fn deinit(self: *LayerParams) void {
+        self.proj.deinit();
+        self.fc.deinit();
+        self.ln2b.deinit();
+        self.ln2g.deinit();
+        self.wo.deinit();
+        self.wv.deinit();
+        self.wk.deinit();
+        self.wq.deinit();
+        self.ln1b.deinit();
+        self.ln1g.deinit();
+    }
+};
+
+const Params = struct {
+    wte: Emb,
+    wpe: PosEmb,
+    lnfg: Norm,
+    lnfb: Norm,
+    layers: []LayerParams,
+
+    fn init(allocator: std.mem.Allocator, ctx: *ExecContext, model: *const Model) !Params {
+        const cfg = model.cfg;
+        const c: usize = cfg.n_embd;
+        const v: usize = cfg.vocab_size;
+        const t: usize = cfg.block_size;
+        const b = model.blob;
+
+        var wte = try varFrom(Emb, ctx, .{ v, c }, b, model.layout.wte, v * c);
+        errdefer wte.deinit();
+        var wpe = try varFrom(PosEmb, ctx, .{ t, c }, b, model.layout.wpe, t * c);
+        errdefer wpe.deinit();
+        var lnfg = try varFrom(Norm, ctx, .{c}, b, model.layout.lnfg, c);
+        errdefer lnfg.deinit();
+        var lnfb = try varFrom(Norm, ctx, .{c}, b, model.layout.lnfb, c);
+        errdefer lnfb.deinit();
+
+        const layers = try allocator.alloc(LayerParams, cfg.n_layer);
+        var built: usize = 0;
+        errdefer {
+            for (layers[0..built]) |*lp| lp.deinit();
+            allocator.free(layers);
+        }
+        while (built < layers.len) : (built += 1) {
+            layers[built] = try LayerParams.init(ctx, model, built);
+        }
+
+        return .{ .wte = wte, .wpe = wpe, .lnfg = lnfg, .lnfb = lnfb, .layers = layers };
+    }
+
+    fn deinit(self: *Params) void {
+        // The slice itself is freed by the owning Session.
+        for (self.layers) |*lp| lp.deinit();
+        self.lnfb.deinit();
+        self.lnfg.deinit();
+        self.wpe.deinit();
+        self.wte.deinit();
+    }
+};
+
+/// A training or inference session over one `Model`.
+///
+/// Heap-allocated because Fucina's `ExecContext` is pinned after `init` (it is
+/// self-referential) and the optimizer retains pointers to the parameter
+/// fields; returning it by value would move both. The model must outlive the
+/// session: every parameter borrows a slice of `model.blob`.
 pub const Session = struct {
     allocator: std.mem.Allocator,
     model: *Model,
     batch: usize,
     max_seq: usize,
 
-    grads: []f32,
+    ctx: ExecContext = undefined,
+    params: Params = undefined,
+    adam: optim.AdamW = undefined,
+    head_map: []usize = &.{},
+    /// Next-token logits for the last `forwardStep` call.
+    logits: []f32 = &.{},
 
-    // per-layer activation cache
-    xin: [][]f32,
-    ln1y: [][]f32,
-    ln1mean: [][]f32,
-    ln1rstd: [][]f32,
-    q: [][]f32,
-    k: [][]f32,
-    v: [][]f32,
-    probs: [][]f32, // [B*H*T*T]
-    ctx: [][]f32,
-    ln2in: [][]f32,
-    ln2y: [][]f32,
-    ln2mean: [][]f32,
-    ln2rstd: [][]f32,
-    h1: [][]f32,
-    h2: [][]f32,
-
-    // globals
-    x: []f32,
-    lnfin: []f32,
-    lnfy: []f32,
-    lnfmean: []f32,
-    lnfrstd: []f32,
-    logits: []f32,
-    dlogits: []f32,
-
-    // scratch
-    s1: []f32,
-    s2: []f32,
-    s3: []f32,
-    s4: []f32,
-    tmp_bt_c: []f32,
-    tmp_t: []f32,
-    dq: []f32,
-    dk: []f32,
-    dv: []f32,
-
-    pub fn init(allocator: std.mem.Allocator, model: *Model, batch: usize) !Session {
-        const cfg = model.cfg;
-        const T: usize = cfg.block_size;
-        const C: usize = cfg.n_embd;
-        const M: usize = cfg.mlpDim();
-        const V: usize = cfg.vocab_size;
-        const B = batch;
-        const BT = B * T;
-        const L: usize = cfg.n_layer;
-
-        const session = Session{
+    pub fn init(allocator: std.mem.Allocator, model: *Model, batch: usize) !*Session {
+        const self = try allocator.create(Session);
+        errdefer allocator.destroy(self);
+        self.* = .{
             .allocator = allocator,
             .model = model,
             .batch = batch,
-            .max_seq = T,
-            .grads = try allocator.alloc(f32, model.blob.len),
-            .xin = try layerBufs(allocator, L, BT * C),
-            .ln1y = try layerBufs(allocator, L, BT * C),
-            .ln1mean = try layerBufs(allocator, L, BT),
-            .ln1rstd = try layerBufs(allocator, L, BT),
-            .q = try layerBufs(allocator, L, BT * C),
-            .k = try layerBufs(allocator, L, BT * C),
-            .v = try layerBufs(allocator, L, BT * C),
-            .probs = try layerBufs(allocator, L, B * cfg.n_head * T * T),
-            .ctx = try layerBufs(allocator, L, BT * C),
-            .ln2in = try layerBufs(allocator, L, BT * C),
-            .ln2y = try layerBufs(allocator, L, BT * C),
-            .ln2mean = try layerBufs(allocator, L, BT),
-            .ln2rstd = try layerBufs(allocator, L, BT),
-            .h1 = try layerBufs(allocator, L, BT * M),
-            .h2 = try layerBufs(allocator, L, BT * M),
-            .x = try allocator.alloc(f32, BT * C),
-            .lnfin = try allocator.alloc(f32, BT * C),
-            .lnfy = try allocator.alloc(f32, BT * C),
-            .lnfmean = try allocator.alloc(f32, BT),
-            .lnfrstd = try allocator.alloc(f32, BT),
-            .logits = try allocator.alloc(f32, BT * V),
-            .dlogits = try allocator.alloc(f32, BT * V),
-            .s1 = try allocator.alloc(f32, BT * @max(C, M)),
-            .s2 = try allocator.alloc(f32, BT * @max(C, M)),
-            .s3 = try allocator.alloc(f32, BT * @max(C, M)),
-            .s4 = try allocator.alloc(f32, BT * @max(C, M)),
-            .tmp_bt_c = try allocator.alloc(f32, BT * C),
-            .tmp_t = try allocator.alloc(f32, T),
-            .dq = try allocator.alloc(f32, BT * C),
-            .dk = try allocator.alloc(f32, BT * C),
-            .dv = try allocator.alloc(f32, BT * C),
+            .max_seq = model.cfg.block_size,
         };
-        @memset(session.grads, 0);
-        return session;
+
+        self.ctx.init(allocator);
+        errdefer self.ctx.deinit();
+
+        self.params = try Params.init(allocator, &self.ctx, model);
+        errdefer {
+            self.params.deinit();
+            allocator.free(self.params.layers);
+        }
+
+        self.adam = try optim.AdamW.init(allocator, .{
+            .lr = 3e-3,
+            .beta1 = 0.9,
+            .beta2 = 0.99,
+            .weight_decay = 0.01,
+        });
+        errdefer self.adam.deinit();
+        try self.registerParams();
+
+        self.head_map = try allocator.alloc(usize, model.cfg.n_head);
+        errdefer allocator.free(self.head_map);
+        for (self.head_map, 0..) |*h, i| h.* = i;
+
+        self.logits = try allocator.alloc(f32, model.cfg.vocab_size);
+        return self;
     }
 
     pub fn deinit(self: *Session) void {
         const a = self.allocator;
-        a.free(self.grads);
-        for ([_][][]f32{ self.xin, self.ln1y, self.ln1mean, self.ln1rstd, self.q, self.k, self.v, self.probs, self.ctx, self.ln2in, self.ln2y, self.ln2mean, self.ln2rstd, self.h1, self.h2 }) |outer| {
-            for (outer) |b| a.free(b);
-            a.free(outer);
-        }
-        a.free(self.x);
-        a.free(self.lnfin);
-        a.free(self.lnfy);
-        a.free(self.lnfmean);
-        a.free(self.lnfrstd);
+        self.adam.deinit();
+        self.params.deinit();
+        a.free(self.params.layers);
+        a.free(self.head_map);
         a.free(self.logits);
-        a.free(self.dlogits);
-        a.free(self.s1);
-        a.free(self.s2);
-        a.free(self.s3);
-        a.free(self.s4);
-        a.free(self.tmp_bt_c);
-        a.free(self.tmp_t);
-        a.free(self.dq);
-        a.free(self.dk);
-        a.free(self.dv);
+        self.ctx.deinit();
+        a.destroy(self);
+    }
+
+    fn registerParams(self: *Session) !void {
+        const p = &self.params;
+        try self.adam.addParam(&p.wte);
+        try self.adam.addParam(&p.wpe);
+        try self.adam.addParam(&p.lnfg);
+        try self.adam.addParam(&p.lnfb);
+        for (p.layers) |*lp| {
+            try self.adam.addParam(&lp.ln1g);
+            try self.adam.addParam(&lp.ln1b);
+            try self.adam.addParam(&lp.wq);
+            try self.adam.addParam(&lp.wk);
+            try self.adam.addParam(&lp.wv);
+            try self.adam.addParam(&lp.wo);
+            try self.adam.addParam(&lp.ln2g);
+            try self.adam.addParam(&lp.ln2b);
+            try self.adam.addParam(&lp.fc);
+            try self.adam.addParam(&lp.proj);
+        }
     }
 
     pub fn paramCount(self: *const Session) usize {
-        return self.grads.len;
+        return self.model.blob.len;
     }
 
     // -- forward ------------------------------------------------------------
 
-    /// Run the transformer over `tokens` (batch*seq ids, row-major), filling
-    /// `self.logits`. `T` may be smaller than the model's block size.
-    pub fn forward(self: *Session, tokens: []const u32, T: usize) void {
-        const model = self.model;
-        const cfg = model.cfg;
-        const C: usize = cfg.n_embd;
-        const H: usize = cfg.n_head;
-        const hd: usize = cfg.headDim();
-        const V: usize = cfg.vocab_size;
-        const M: usize = cfg.mlpDim();
-        const L: usize = cfg.n_layer;
-        const B = self.batch;
-        const BT = B * T;
+    /// Run the transformer over `tokens` (batch*seq ids, row-major) and return
+    /// `[batch*seq, vocab]` logits. Must be called inside an exec scope.
+    fn forwardTrain(self: *Session, tokens: []const u32, T: usize) !Logits {
+        const cfg = self.model.cfg;
+        const BT = self.batch * T;
         std.debug.assert(tokens.len >= BT);
         std.debug.assert(T <= self.max_seq);
 
-        const p = model.blob;
+        const alloc = self.ctx.allocator();
+        const tok_idx = try alloc.alloc(usize, BT);
+        defer alloc.free(tok_idx);
+        const pos_idx = try alloc.alloc(usize, BT);
+        defer alloc.free(pos_idx);
+        for (0..BT) |r| {
+            std.debug.assert(tokens[r] < cfg.vocab_size);
+            tok_idx[r] = tokens[r];
+            pos_idx[r] = r % T;
+        }
+
+        var x = try self.params.wte.gather(&self.ctx, .vocab, tok_idx, .seq);
+        const pe = try self.params.wpe.gather(&self.ctx, .pos, pos_idx, .seq);
+        x = try x.add(&self.ctx, &pe);
+
+        for (0..cfg.n_layer) |l| {
+            x = try self.forwardBlock(l, &x, T);
+        }
+
+        const nf = try x.layerNorm(&self.ctx, .model, eps, .{
+            .weight = &self.params.lnfg,
+            .bias = &self.params.lnfb,
+        });
+        return nf.matmul(&self.ctx, &self.params.wte, .trans_b, .{ .seq, .vocab });
+    }
+
+    fn forwardBlock(self: *Session, l: usize, x: *const Stream, T: usize) !Stream {
+        const lp = &self.params.layers[l];
+        const ctx = &self.ctx;
+
+        const n1 = try x.layerNorm(ctx, .model, eps, .{ .weight = &lp.ln1g, .bias = &lp.ln1b });
+        const q = try n1.matmul(ctx, &lp.wq, .plain, .{ .seq, .model });
+        const k = try n1.matmul(ctx, &lp.wk, .plain, .{ .seq, .model });
+        const v = try n1.matmul(ctx, &lp.wv, .plain, .{ .seq, .model });
+
+        const attn = try self.attention(&q, &k, &v, T);
+        const o = try attn.matmul(ctx, &lp.wo, .plain, .{ .seq, .model });
+        const x1 = try x.add(ctx, &o);
+
+        const n2 = try x1.layerNorm(ctx, .model, eps, .{ .weight = &lp.ln2g, .bias = &lp.ln2b });
+        const h = try n2.matmul(ctx, &lp.fc, .plain, .{ .seq, .hidden });
+        const hg = try h.gelu(ctx);
+        const p = try hg.matmul(ctx, &lp.proj, .plain, .{ .seq, .model });
+        return x1.add(ctx, &p);
+    }
+
+    /// Causal attention for every batch row, then re-concatenated along seq.
+    fn attention(self: *Session, q: *const Stream, k: *const Stream, v: *const Stream, T: usize) !AttnStream {
+        const cfg = self.model.cfg;
+        const H: usize = cfg.n_head;
+        const hd: usize = cfg.headDim();
+        const B = self.batch;
+        const alloc = self.ctx.allocator();
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
 
-        // token + position embeddings
-        for (0..BT) |r| {
-            const tok: usize = tokens[r];
-            std.debug.assert(tok < V);
-            const row = self.x[r * C ..][0..C];
-            @memcpy(row, p[model.layout.wte + tok * C ..][0..C]);
-            const pos = r % T;
-            const prow = p[model.layout.wpe + pos * C ..][0..C];
-            for (row, prow) |*xv, pv| xv.* += pv;
+        const parts = try alloc.alloc(AttnStream, B);
+        defer alloc.free(parts);
+        for (0..B) |b| {
+            const qb = try q.narrow(&self.ctx, .seq, b * T, T);
+            const kb = try k.narrow(&self.ctx, .seq, b * T, T);
+            const vb = try v.narrow(&self.ctx, .seq, b * T, T);
+            const q3 = try qb.split(&self.ctx, .model, .{ .head, .d }, .{ H, hd });
+            const k3 = try kb.split(&self.ctx, .model, .{ .kv_head, .d }, .{ H, hd });
+            const v3 = try vb.split(&self.ctx, .model, .{ .kv_head, .d }, .{ H, hd });
+            parts[b] = try q3.groupedAttention(&self.ctx, &k3, &v3, self.head_map, .attn, scale, .{});
         }
+        if (B == 1) return parts[0];
 
-        for (0..L) |l| {
-            const lo = model.layout.layers[l];
-            const xn = self.x[0 .. BT * C];
-
-            // --- attention block ---
-            @memcpy(self.xin[l][0 .. BT * C], xn);
-            tensor.layerNorm(
-                xn,
-                p[lo.ln1g..][0..C],
-                p[lo.ln1b..][0..C],
-                self.ln1y[l][0 .. BT * C],
-                self.ln1mean[l][0..BT],
-                self.ln1rstd[l][0..BT],
-                BT,
-                C,
-            );
-            tensor.matmul(BT, C, C, self.ln1y[l][0 .. BT * C], p[lo.wq..][0 .. C * C], self.q[l][0 .. BT * C]);
-            tensor.matmul(BT, C, C, self.ln1y[l][0 .. BT * C], p[lo.wk..][0 .. C * C], self.k[l][0 .. BT * C]);
-            tensor.matmul(BT, C, C, self.ln1y[l][0 .. BT * C], p[lo.wv..][0 .. C * C], self.v[l][0 .. BT * C]);
-
-            for (0..B) |b| {
-                for (0..H) |h| {
-                    const off = h * hd;
-                    const pbase = (b * H + h) * T * T;
-                    for (0..T) |t| {
-                        const r = b * T + t;
-                        const qv = self.q[l][r * C + off ..][0..hd];
-                        const prow = self.probs[l][pbase + t * T ..][0..T];
-                        for (0..t + 1) |s| {
-                            const kv = self.k[l][(b * T + s) * C + off ..][0..hd];
-                            prow[s] = tensor.dot(qv, kv) * scale;
-                        }
-                        for (t + 1..T) |s| prow[s] = 0;
-                        tensor.softmax(prow[0 .. t + 1]);
-                        const cv = self.ctx[l][r * C + off ..][0..hd];
-                        @memset(cv, 0);
-                        for (0..t + 1) |s| {
-                            const vv = self.v[l][(b * T + s) * C + off ..][0..hd];
-                            const w = prow[s];
-                            for (cv, vv) |*c, val| c.* += w * val;
-                        }
-                    }
-                }
-            }
-
-            tensor.matmul(BT, C, C, self.ctx[l][0 .. BT * C], p[lo.wo..][0 .. C * C], self.s1[0 .. BT * C]);
-            tensor.addInPlace(xn, self.s1[0 .. BT * C]);
-
-            // --- mlp block ---
-            @memcpy(self.ln2in[l][0 .. BT * C], xn);
-            tensor.layerNorm(
-                xn,
-                p[lo.ln2g..][0..C],
-                p[lo.ln2b..][0..C],
-                self.ln2y[l][0 .. BT * C],
-                self.ln2mean[l][0..BT],
-                self.ln2rstd[l][0..BT],
-                BT,
-                C,
-            );
-            tensor.matmul(BT, M, C, self.ln2y[l][0 .. BT * C], p[lo.fc..][0 .. C * M], self.h1[l][0 .. BT * M]);
-            @memcpy(self.h2[l][0 .. BT * M], self.h1[l][0 .. BT * M]);
-            tensor.geluInPlace(self.h2[l][0 .. BT * M]);
-            tensor.matmul(BT, C, M, self.h2[l][0 .. BT * M], p[lo.proj..][0 .. M * C], self.s1[0 .. BT * C]);
-            tensor.addInPlace(xn, self.s1[0 .. BT * C]);
-        }
-
-        // final norm + tied head
-        @memcpy(self.lnfin[0 .. BT * C], self.x[0 .. BT * C]);
-        tensor.layerNorm(
-            self.lnfin[0 .. BT * C],
-            p[model.layout.lnfg..][0..C],
-            p[model.layout.lnfb..][0..C],
-            self.lnfy[0 .. BT * C],
-            self.lnfmean[0..BT],
-            self.lnfrstd[0..BT],
-            BT,
-            C,
-        );
-        tensor.matmulNt(BT, V, C, self.lnfy[0 .. BT * C], p[model.layout.wte..][0 .. V * C], self.logits[0 .. BT * V]);
+        const refs = try alloc.alloc(*const AttnStream, B - 1);
+        defer alloc.free(refs);
+        for (1..B) |i| refs[i - 1] = &parts[i];
+        return parts[0].concat(&self.ctx, .seq, refs);
     }
 
     /// Mean cross-entropy loss for the current batch (no gradients touched).
-    pub fn lossOnly(self: *Session, tokens: []const u32, targets: []const u32, T: usize) f32 {
-        self.forward(tokens, T);
-        const V: usize = self.model.cfg.vocab_size;
-        const BT = self.batch * T;
-        var loss: f32 = 0;
-        for (0..BT) |r| {
-            const lr = self.logits[r * V ..][0..V];
-            var max: f32 = lr[0];
-            for (lr) |v| max = @max(max, v);
-            var sum: f32 = 0;
-            for (lr) |v| sum += @exp(v - max);
-            loss += @log(sum) + max - lr[targets[r]];
-        }
-        return loss / @as(f32, @floatFromInt(BT));
+    pub fn lossOnly(self: *Session, tokens: []const u32, targets: []const u32, T: usize) !f32 {
+        const scope = self.ctx.openExecScope();
+        defer self.ctx.closeExecScope(scope);
+
+        const logits = try self.forwardTrain(tokens, T);
+        const label_ids = try self.labels(targets, self.batch * T);
+        defer self.ctx.allocator().free(label_ids);
+        var loss = try logits.crossEntropy(&self.ctx, .vocab, label_ids, .{});
+        return loss.item();
+    }
+
+    /// Copy of the `[batch*seq, vocab]` logits (used by the cached-decoding
+    /// parity test and other diagnostics).
+    pub fn logitsAlloc(self: *Session, allocator: std.mem.Allocator, tokens: []const u32, T: usize) ![]f32 {
+        const scope = self.ctx.openExecScope();
+        defer self.ctx.closeExecScope(scope);
+        const logits = try self.forwardTrain(tokens, T);
+        return allocator.dupe(f32, try logits.dataConst());
+    }
+
+    fn labels(self: *Session, targets: []const u32, n: usize) ![]usize {
+        std.debug.assert(targets.len >= n);
+        const out = try self.ctx.allocator().alloc(usize, n);
+        for (0..n) |i| out[i] = targets[i];
+        return out;
     }
 
     /// Run `tokens` through the model and fill the KV cache with their keys and
     /// values, so the next `forwardStep` only has to look at one new token.
-    /// Requires a batch-1 session.
-    pub fn forwardPrefill(self: *Session, cache: *KvCache, tokens: []const u32, T: usize) void {
-        std.debug.assert(self.batch == 1);
+    pub fn forwardPrefill(self: *Session, cache: *KvCache, tokens: []const u32, T: usize) !void {
         std.debug.assert(T <= cache.max_seq);
-        self.forward(tokens, T);
-        const C: usize = self.model.cfg.n_embd;
-        for (0..self.model.cfg.n_layer) |l| {
-            @memcpy(cache.k[l][0 .. T * C], self.k[l][0 .. T * C]);
-            @memcpy(cache.v[l][0 .. T * C], self.v[l][0 .. T * C]);
+        for (tokens[0..T], 0..) |tok, i| {
+            try self.forwardStep(cache, tok, i);
         }
-        cache.pos = T;
     }
 
     /// Decode a single new token at position `pos` (== cache.pos), reading keys
     /// and values out of `cache`. Writes the next-token logits into
     /// `self.logits[0..vocab]`.
-    pub fn forwardStep(self: *Session, cache: *KvCache, token: u32, pos: usize) void {
-        const model = self.model;
-        const cfg = model.cfg;
+    pub fn forwardStep(self: *Session, cache: *KvCache, token: u32, pos: usize) !void {
+        const cfg = self.model.cfg;
         const C: usize = cfg.n_embd;
         const H: usize = cfg.n_head;
         const hd: usize = cfg.headDim();
-        const V: usize = cfg.vocab_size;
-        const M: usize = cfg.mlpDim();
-        const L: usize = cfg.n_layer;
-        std.debug.assert(self.batch == 1);
         std.debug.assert(pos < cache.max_seq);
+        std.debug.assert(token < cfg.vocab_size);
 
-        const p = model.blob;
+        const scope = self.ctx.openExecScope();
+        defer self.ctx.closeExecScope(scope);
+        var no_grad = fucina.noGrad();
+        defer no_grad.close();
+
+        const ctx = &self.ctx;
+        const p = &self.params;
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-        const x = self.x[0..C];
+        const tok_idx = [_]usize{token};
+        const pos_idx = [_]usize{pos};
 
-        // embedding for this single position
-        std.debug.assert(token < V);
-        @memcpy(x, p[model.layout.wte + @as(usize, token) * C ..][0..C]);
-        const prow = p[model.layout.wpe + pos * C ..][0..C];
-        for (x, prow) |*xv, pv| xv.* += pv;
+        var x = try p.wte.gather(ctx, .vocab, &tok_idx, .seq);
+        const pe = try p.wpe.gather(ctx, .pos, &pos_idx, .seq);
+        x = try x.add(ctx, &pe);
 
-        for (0..L) |l| {
-            const lo = model.layout.layers[l];
-            const ln1 = self.ln1y[l][0..C];
-            tensor.layerNorm(x, p[lo.ln1g..][0..C], p[lo.ln1b..][0..C], ln1, self.ln1mean[l][0..1], self.ln1rstd[l][0..1], 1, C);
+        for (0..cfg.n_layer) |l| {
+            const lp = &p.layers[l];
+            const n1 = try x.layerNorm(ctx, .model, eps, .{ .weight = &lp.ln1g, .bias = &lp.ln1b });
+            const q = try n1.matmul(ctx, &lp.wq, .plain, .{ .seq, .model });
+            const k = try n1.matmul(ctx, &lp.wk, .plain, .{ .seq, .model });
+            const v = try n1.matmul(ctx, &lp.wv, .plain, .{ .seq, .model });
 
-            const qrow = self.q[l][0..C];
-            const krow = self.k[l][0..C];
-            const vrow = self.v[l][0..C];
-            tensor.matmul(1, C, C, ln1, p[lo.wq..][0 .. C * C], qrow);
-            tensor.matmul(1, C, C, ln1, p[lo.wk..][0 .. C * C], krow);
-            tensor.matmul(1, C, C, ln1, p[lo.wv..][0 .. C * C], vrow);
-            @memcpy(cache.k[l][pos * C ..][0..C], krow);
-            @memcpy(cache.v[l][pos * C ..][0..C], vrow);
+            const q3 = try q.split(ctx, .model, .{ .head, .d }, .{ H, hd });
+            const k3 = try k.split(ctx, .model, .{ .kv_head, .d }, .{ H, hd });
+            const v3 = try v.split(ctx, .model, .{ .kv_head, .d }, .{ H, hd });
+            @memcpy(cache.k[l][pos * C ..][0..C], try k3.dataConst());
+            @memcpy(cache.v[l][pos * C ..][0..C], try v3.dataConst());
 
-            const ctxrow = self.ctx[l][0..C];
-            for (0..H) |h| {
-                const off = h * hd;
-                const qv = qrow[off..][0..hd];
-                const scores = self.tmp_t[0 .. pos + 1];
-                for (0..pos + 1) |t| {
-                    const kv = cache.k[l][t * C + off ..][0..hd];
-                    scores[t] = tensor.dot(qv, kv) * scale;
-                }
-                tensor.softmax(scores);
-                const cv = ctxrow[off..][0..hd];
-                @memset(cv, 0);
-                for (0..pos + 1) |t| {
-                    const vv = cache.v[l][t * C + off ..][0..hd];
-                    const w = scores[t];
-                    for (cv, vv) |*c, val| c.* += w * val;
-                }
-            }
+            var kview = try fucina.Tensor(.{ .seq, .kv_head, .d }).fromBorrowedConstSlice(
+                ctx,
+                .{ pos + 1, H, hd },
+                cache.k[l][0 .. (pos + 1) * C],
+            );
+            defer kview.deinit();
+            var vview = try fucina.Tensor(.{ .seq, .kv_head, .d }).fromBorrowedConstSlice(
+                ctx,
+                .{ pos + 1, H, hd },
+                cache.v[l][0 .. (pos + 1) * C],
+            );
+            defer vview.deinit();
 
-            tensor.matmul(1, C, C, ctxrow, p[lo.wo..][0 .. C * C], self.s1[0..C]);
-            for (x, self.s1[0..C]) |*xv, sv| xv.* += sv;
+            const attn = try q3.groupedAttention(ctx, &kview, &vview, self.head_map, .attn, scale, .{});
+            const o = try attn.matmul(ctx, &lp.wo, .plain, .{ .seq, .model });
+            const x1 = try x.add(ctx, &o);
 
-            const ln2 = self.ln2y[l][0..C];
-            tensor.layerNorm(x, p[lo.ln2g..][0..C], p[lo.ln2b..][0..C], ln2, self.ln2mean[l][0..1], self.ln2rstd[l][0..1], 1, C);
-            const hrow = self.h2[l][0..M];
-            tensor.matmul(1, M, C, ln2, p[lo.fc..][0 .. C * M], hrow);
-            tensor.geluInPlace(hrow);
-            tensor.matmul(1, C, M, hrow, p[lo.proj..][0 .. M * C], self.s1[0..C]);
-            for (x, self.s1[0..C]) |*xv, sv| xv.* += sv;
+            const n2 = try x1.layerNorm(ctx, .model, eps, .{ .weight = &lp.ln2g, .bias = &lp.ln2b });
+            const h = try n2.matmul(ctx, &lp.fc, .plain, .{ .seq, .hidden });
+            const hg = try h.gelu(ctx);
+            const pr = try hg.matmul(ctx, &lp.proj, .plain, .{ .seq, .model });
+            x = try x1.add(ctx, &pr);
         }
 
-        const lnf = self.lnfy[0..C];
-        tensor.layerNorm(x, p[model.layout.lnfg..][0..C], p[model.layout.lnfb..][0..C], lnf, self.lnfmean[0..1], self.lnfrstd[0..1], 1, C);
-        tensor.matmulNt(1, V, C, lnf, p[model.layout.wte..][0 .. V * C], self.logits[0..V]);
+        const nf = try x.layerNorm(ctx, .model, eps, .{ .weight = &p.lnfg, .bias = &p.lnfb });
+        const logits = try nf.matmul(ctx, &p.wte, .trans_b, .{ .seq, .vocab });
+        @memcpy(self.logits, try logits.dataConst());
 
         cache.pos = pos + 1;
     }
@@ -435,234 +480,50 @@ pub const Session = struct {
     // -- backward -----------------------------------------------------------
 
     pub fn zeroGrads(self: *Session) void {
-        @memset(self.grads, 0);
+        self.adam.zeroGrad();
     }
 
-    /// Forward + backward. Gradients accumulate into `self.grads`, so call
-    /// `zeroGrads` first for a clean step.
-    pub fn fwdBwd(self: *Session, tokens: []const u32, targets: []const u32, T: usize) f32 {
-        self.forward(tokens, T);
-        const cfg = self.model.cfg;
-        const C: usize = cfg.n_embd;
-        const H: usize = cfg.n_head;
-        const hd: usize = cfg.headDim();
-        const V: usize = cfg.vocab_size;
-        const M: usize = cfg.mlpDim();
-        const L: usize = cfg.n_layer;
-        const B = self.batch;
-        const BT = B * T;
+    /// Forward + backward. Gradients accumulate into the parameter leaves, so
+    /// call `zeroGrads` first for a clean step.
+    pub fn fwdBwd(self: *Session, tokens: []const u32, targets: []const u32, T: usize) !f32 {
+        const scope = self.ctx.openExecScope();
+        defer self.ctx.closeExecScope(scope);
 
-        const model = self.model;
-        const p = model.blob;
-        const g = self.grads;
-        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-
-        const loss = tensor.softmaxCrossEntropy(
-            self.logits[0 .. BT * V],
-            targets,
-            self.dlogits[0 .. BT * V],
-            BT,
-            V,
-        );
-
-        // dx is the gradient of the residual stream; s2 = dx
-        const dx = self.s2[0 .. BT * C];
-
-        // tied head: dlnfy = dlogits @ wte ; dwte += dlogits^T @ lnfy
-        tensor.matmul(BT, C, V, self.dlogits[0 .. BT * V], p[model.layout.wte..][0 .. V * C], self.s3[0 .. BT * C]);
-        {
-            const dwte = g[model.layout.wte..][0 .. V * C];
-            for (0..BT) |r| {
-                const dl = self.dlogits[r * V ..][0..V];
-                const xr = self.lnfy[r * C ..][0..C];
-                for (dl, 0..) |av, n| {
-                    if (av == 0) continue;
-                    const wrow = dwte[n * C ..][0..C];
-                    for (wrow, xr) |*wv, xv| wv.* += av * xv;
-                }
-            }
-        }
-
-        // final layer norm
-        @memset(dx, 0);
-        tensor.layerNormBwd(
-            self.s3[0 .. BT * C],
-            self.lnfin[0 .. BT * C],
-            p[model.layout.lnfg..][0..C],
-            self.lnfmean[0..BT],
-            self.lnfrstd[0..BT],
-            dx,
-            g[model.layout.lnfg..][0..C],
-            g[model.layout.lnfb..][0..C],
-            BT,
-            C,
-        );
-
-        var l: usize = L;
-        while (l > 0) {
-            l -= 1;
-            const lo = model.layout.layers[l];
-
-            // ---- mlp branch ----
-            const dh2 = self.s3[0 .. BT * M];
-            const dh1 = self.s1[0 .. BT * M];
-            @memset(dh2, 0);
-            tensor.matmulNtAcc(BT, M, C, dx, p[lo.proj..][0 .. M * C], dh2);
-            tensor.matmulTnAcc(M, C, BT, self.h2[l][0 .. BT * M], dx, g[lo.proj..][0 .. M * C]);
-            @memset(dh1, 0);
-            tensor.geluBwdAcc(dh2, self.h1[l][0 .. BT * M], dh1);
-
-            tensor.matmulTnAcc(C, M, BT, self.ln2y[l][0 .. BT * C], dh1, g[lo.fc..][0 .. C * M]);
-            const dln2y = self.s4[0 .. BT * C];
-            @memset(dln2y, 0);
-            tensor.matmulNtAcc(BT, C, M, dh1, p[lo.fc..][0 .. C * M], dln2y);
-
-            @memset(self.tmp_bt_c, 0);
-            tensor.layerNormBwd(
-                dln2y,
-                self.ln2in[l][0 .. BT * C],
-                p[lo.ln2g..][0..C],
-                self.ln2mean[l][0..BT],
-                self.ln2rstd[l][0..BT],
-                self.tmp_bt_c,
-                g[lo.ln2g..][0..C],
-                g[lo.ln2b..][0..C],
-                BT,
-                C,
-            );
-            tensor.addInPlace(dx, self.tmp_bt_c[0 .. BT * C]);
-
-            // ---- attention branch ----
-            const dctx = self.s4[0 .. BT * C];
-            @memset(dctx, 0);
-            tensor.matmulNtAcc(BT, C, C, dx, p[lo.wo..][0 .. C * C], dctx);
-            tensor.matmulTnAcc(C, C, BT, self.ctx[l][0 .. BT * C], dx, g[lo.wo..][0 .. C * C]);
-
-            const dq = self.dq;
-            const dk = self.dk;
-            const dv = self.dv;
-            @memset(dq, 0);
-            @memset(dk, 0);
-            @memset(dv, 0);
-
-            for (0..B) |b| {
-                for (0..H) |h| {
-                    const off = h * hd;
-                    const pbase = (b * H + h) * T * T;
-                    for (0..T) |t| {
-                        const r = b * T + t;
-                        const dOv = dctx[r * C + off ..][0..hd];
-                        const prow = self.probs[l][pbase + t * T ..][0..T];
-                        const dP = self.tmp_t[0..T];
-                        for (0..t + 1) |s| {
-                            const rr = b * T + s;
-                            const dvs = dv[rr * C + off ..][0..hd];
-                            const w = prow[s];
-                            for (dvs, dOv) |*dvi, oi| dvi.* += w * oi;
-                            dP[s] = tensor.dot(dOv, self.v[l][rr * C + off ..][0..hd]);
-                        }
-                        var sum: f32 = 0;
-                        for (0..t + 1) |s| sum += prow[s] * dP[s];
-                        const qv = self.q[l][r * C + off ..][0..hd];
-                        const dqv = dq[r * C + off ..][0..hd];
-                        for (0..t + 1) |s| {
-                            const rr = b * T + s;
-                            const ds = (dP[s] - sum) * prow[s] * scale;
-                            const kv = self.k[l][rr * C + off ..][0..hd];
-                            for (dqv, kv) |*dqi, ki| dqi.* += ds * ki;
-                            const dkv = dk[rr * C + off ..][0..hd];
-                            for (dkv, qv) |*dki, qi| dki.* += ds * qi;
-                        }
-                    }
-                }
-            }
-
-            tensor.matmulTnAcc(C, C, BT, self.ln1y[l][0 .. BT * C], dq, g[lo.wq..][0 .. C * C]);
-            tensor.matmulTnAcc(C, C, BT, self.ln1y[l][0 .. BT * C], dk, g[lo.wk..][0 .. C * C]);
-            tensor.matmulTnAcc(C, C, BT, self.ln1y[l][0 .. BT * C], dv, g[lo.wv..][0 .. C * C]);
-
-            const dln1y = self.s3[0 .. BT * C];
-            @memset(dln1y, 0);
-            tensor.matmulNtAcc(BT, C, C, dq, p[lo.wq..][0 .. C * C], dln1y);
-            tensor.matmulNtAcc(BT, C, C, dk, p[lo.wk..][0 .. C * C], dln1y);
-            tensor.matmulNtAcc(BT, C, C, dv, p[lo.wv..][0 .. C * C], dln1y);
-
-            @memset(self.tmp_bt_c, 0);
-            tensor.layerNormBwd(
-                dln1y,
-                self.xin[l][0 .. BT * C],
-                p[lo.ln1g..][0..C],
-                self.ln1mean[l][0..BT],
-                self.ln1rstd[l][0..BT],
-                self.tmp_bt_c,
-                g[lo.ln1g..][0..C],
-                g[lo.ln1b..][0..C],
-                BT,
-                C,
-            );
-            tensor.addInPlace(dx, self.tmp_bt_c[0 .. BT * C]);
-        }
-
-        // embedding grads
-        {
-            const dwte = g[model.layout.wte..][0 .. V * C];
-            const dwpe = g[model.layout.wpe..][0 .. self.max_seq * C];
-            for (0..BT) |r| {
-                const tok: usize = tokens[r];
-                const drow = dx[r * C ..][0..C];
-                const wrow = dwte[tok * C ..][0..C];
-                for (wrow, drow) |*wv, dv| wv.* += dv;
-                const pos = r % T;
-                const prow = dwpe[pos * C ..][0..C];
-                for (prow, drow) |*wv, dv| wv.* += dv;
-            }
-            _ = self.s4;
-        }
-
-        return loss;
+        const logits = try self.forwardTrain(tokens, T);
+        const label_ids = try self.labels(targets, self.batch * T);
+        defer self.ctx.allocator().free(label_ids);
+        var loss = try logits.crossEntropy(&self.ctx, .vocab, label_ids, .{});
+        try loss.backward(&self.ctx);
+        return loss.item();
     }
 
     // -- optimisation -------------------------------------------------------
 
-    pub fn gradNorm(self: *Session) f32 {
-        var sum: f32 = 0;
-        for (self.grads) |v| sum += v * v;
-        return @sqrt(sum);
+    pub fn gradNorm(self: *Session) !f32 {
+        return @floatCast(@sqrt(try self.adam.gradSquaredNorm(&self.ctx)));
     }
 
-    pub fn clipGrads(self: *Session, max_norm: f32) f32 {
-        const norm = self.gradNorm();
-        if (norm > max_norm and norm > 0) {
-            const s = max_norm / norm;
-            for (self.grads) |*v| v.* *= s;
-        }
-        return norm;
+    pub fn clipGrads(self: *Session, max_norm: f32) !f32 {
+        return self.adam.clipGradNorm(&self.ctx, max_norm);
     }
 
-    /// AdamW step: decoupled weight decay, bias-corrected moments.
-    pub fn adamStep(self: *Session, opt: *OptState, lr: f32, weight_decay: f32, beta1: f32, beta2: f32) void {
-        opt.t += 1;
-        const t: f32 = @floatFromInt(opt.t);
-        const bc1 = 1.0 - std.math.pow(f32, beta1, t);
-        const bc2 = 1.0 - std.math.pow(f32, beta2, t);
-        const eps: f32 = 1e-8;
-        const params = self.model.blob;
-        for (params, self.grads, opt.m, opt.v) |*pv, gv, *mv, *vv| {
-            mv.* = beta1 * mv.* + (1.0 - beta1) * gv;
-            vv.* = beta2 * vv.* + (1.0 - beta2) * gv * gv;
-            const mhat = mv.* / bc1;
-            const vhat = vv.* / bc2;
-            pv.* -= lr * (mhat / (@sqrt(vhat) + eps) + weight_decay * pv.*);
-        }
+    /// AdamW step with decoupled weight decay.
+    pub fn adamStep(self: *Session, lr: f32, weight_decay: f32, beta1: f32, beta2: f32) !void {
+        self.adam.config.lr = lr;
+        self.adam.config.weight_decay = weight_decay;
+        self.adam.config.beta1 = beta1;
+        self.adam.config.beta2 = beta2;
+        try self.adam.step(&self.ctx);
     }
 
     // -- sampling -----------------------------------------------------------
 
     /// Autoregressive generation with a KV cache.
     ///
-    /// The prompt is prefilled in one batched pass, then each new token costs a
-    /// single-row forward over the cached keys/values. When the context fills up
-    /// the newest half is kept and prefilled again.
+    /// The prompt is prefilled one token at a time (each step fills one cache
+    /// row), then each new token costs a single-row forward over the cached
+    /// keys/values. When the context fills up the newest half is kept and
+    /// replayed.
     pub fn generate(
         self: *Session,
         allocator: std.mem.Allocator,
@@ -675,7 +536,6 @@ pub const Session = struct {
         const cfg = self.model.cfg;
         const V: usize = cfg.vocab_size;
         const block: usize = cfg.block_size;
-        std.debug.assert(self.batch == 1);
         if (prompt.len == 0) return error.EmptyPrompt;
 
         var rng = std.Random.DefaultPrng.init(params.seed);
@@ -693,8 +553,8 @@ pub const Session = struct {
         const pre_len = @min(prompt.len, block);
         @memcpy(ctx_buf[0..pre_len], prompt[prompt.len - pre_len ..]);
         var ctx_len: usize = pre_len;
-        self.forwardPrefill(&cache, ctx_buf[0..ctx_len], ctx_len);
-        var logits_row = self.logits[(ctx_len - 1) * V ..][0..V];
+        try self.forwardPrefill(&cache, ctx_buf[0..ctx_len], ctx_len);
+        var logits_row = self.logits[0..V];
 
         for (0..max_new_tokens) |_| {
             if (cache.pos >= block) {
@@ -703,8 +563,8 @@ pub const Session = struct {
                 std.mem.copyForwards(u32, ctx_buf[0..keep], ctx_buf[ctx_len - keep .. ctx_len]);
                 ctx_len = keep;
                 cache.reset();
-                self.forwardPrefill(&cache, ctx_buf[0..ctx_len], ctx_len);
-                logits_row = self.logits[(ctx_len - 1) * V ..][0..V];
+                try self.forwardPrefill(&cache, ctx_buf[0..ctx_len], ctx_len);
+                logits_row = self.logits[0..V];
             }
 
             @memcpy(cand, logits_row);
@@ -718,7 +578,7 @@ pub const Session = struct {
             if (sink) |s| s.send(next);
 
             if (cache.pos < block) {
-                self.forwardStep(&cache, next, cache.pos);
+                try self.forwardStep(&cache, next, cache.pos);
                 logits_row = self.logits[0..V];
             }
         }
@@ -755,6 +615,12 @@ pub const Session = struct {
     }
 };
 
+fn varFrom(comptime T: type, ctx: *ExecContext, shape: anytype, blob: []f32, offset: usize, len: usize) !T {
+    var raw = try ctx.fromBorrowedSlice(.f32, shape, blob[offset..][0..len]);
+    errdefer raw.deinit();
+    return T.variable(ctx, raw);
+}
+
 fn layerBufs(allocator: std.mem.Allocator, n: usize, len: usize) ![][]f32 {
     const outer = try allocator.alloc([]f32, n);
     var i: usize = 0;
@@ -789,16 +655,16 @@ test "forward produces finite logits of the right shape" {
 
     var m = try Model.initRandom(allocator, tiny_test_cfg, "abcdefgh", 3);
     defer m.deinit();
-    var s = try Session.init(allocator, &m, 2);
+    const s = try Session.init(allocator, &m, 2);
     defer s.deinit();
 
     const T = 5;
     const tokens = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 1, 2 };
-    s.forward(&tokens, T);
-    for (s.logits[0 .. 2 * T * tiny_test_cfg.vocab_size]) |v| {
-        try testing.expect(std.math.isFinite(v));
-    }
-    try testing.expect(s.logits[0] != s.logits[1]);
+    const logits = try s.logitsAlloc(allocator, &tokens, T);
+    defer allocator.free(logits);
+    try testing.expectEqual(@as(usize, 2 * T * tiny_test_cfg.vocab_size), logits.len);
+    for (logits) |v| try testing.expect(std.math.isFinite(v));
+    try testing.expect(logits[0] != logits[1]);
 }
 
 test "gradients match finite differences" {
@@ -809,7 +675,7 @@ test "gradients match finite differences" {
     const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_embd = 8, .block_size = 4, .vocab_size = 6 };
     var m = try Model.initRandom(allocator, cfg, "abcdef", 99);
     defer m.deinit();
-    var s = try Session.init(allocator, &m, 2);
+    const s = try Session.init(allocator, &m, 2);
     defer s.deinit();
 
     const T = 3;
@@ -817,33 +683,59 @@ test "gradients match finite differences" {
     const targets = [_]u32{ 1, 2, 3, 4, 5, 0 };
 
     s.zeroGrads();
-    _ = s.fwdBwd(&tokens, &targets, T);
+    _ = try s.fwdBwd(&tokens, &targets, T);
 
-    // Probe a spread of parameters: embeddings, attention, mlp and layernorm.
-    const indices = [_]usize{
-        m.layout.wte + 1,
-        m.layout.wpe + 1,
-        m.layout.layers[0].wq + 3,
-        m.layout.layers[0].fc + 5,
-        m.layout.layers[0].proj + 7,
-        m.layout.lnfg,
-        m.layout.layers[0].ln1g + 1,
-    };
+    const Probe = struct { idx: usize, grad: f32 };
+    var probes: [7]Probe = undefined;
+    {
+        var g = (try s.params.wte.grad(&s.ctx)).?;
+        defer g.deinit();
+        probes[0] = .{ .idx = m.layout.wte + 1, .grad = (try g.dataConst())[1] };
+    }
+    {
+        var g = (try s.params.wpe.grad(&s.ctx)).?;
+        defer g.deinit();
+        probes[1] = .{ .idx = m.layout.wpe + 1, .grad = (try g.dataConst())[1] };
+    }
+    {
+        var g = (try s.params.layers[0].wq.grad(&s.ctx)).?;
+        defer g.deinit();
+        probes[2] = .{ .idx = m.layout.layers[0].wq + 3, .grad = (try g.dataConst())[3] };
+    }
+    {
+        var g = (try s.params.layers[0].fc.grad(&s.ctx)).?;
+        defer g.deinit();
+        probes[3] = .{ .idx = m.layout.layers[0].fc + 5, .grad = (try g.dataConst())[5] };
+    }
+    {
+        var g = (try s.params.layers[0].proj.grad(&s.ctx)).?;
+        defer g.deinit();
+        probes[4] = .{ .idx = m.layout.layers[0].proj + 7, .grad = (try g.dataConst())[7] };
+    }
+    {
+        var g = (try s.params.lnfg.grad(&s.ctx)).?;
+        defer g.deinit();
+        probes[5] = .{ .idx = m.layout.lnfg, .grad = (try g.dataConst())[0] };
+    }
+    {
+        var g = (try s.params.layers[0].ln1g.grad(&s.ctx)).?;
+        defer g.deinit();
+        probes[6] = .{ .idx = m.layout.layers[0].ln1g + 1, .grad = (try g.dataConst())[1] };
+    }
 
     const h: f32 = 1e-2;
-    for (indices) |idx| {
-        const orig = m.blob[idx];
-        m.blob[idx] = orig + h;
-        const lp = s.lossOnly(&tokens, &targets, T);
-        m.blob[idx] = orig - h;
-        const lm = s.lossOnly(&tokens, &targets, T);
-        m.blob[idx] = orig;
+    for (probes) |p| {
+        const orig = m.blob[p.idx];
+        m.blob[p.idx] = orig + h;
+        const lp = try s.lossOnly(&tokens, &targets, T);
+        m.blob[p.idx] = orig - h;
+        const lm = try s.lossOnly(&tokens, &targets, T);
+        m.blob[p.idx] = orig;
 
         const numeric = (lp - lm) / (2 * h);
-        const analytic = s.grads[idx];
         const tol = 2e-2 * @max(@abs(numeric), 1e-2) + 1e-3;
-        if (@abs(numeric - analytic) >= tol) {
-            std.debug.print("gradient mismatch at {d}: numeric {d:.6} analytic {d:.6}\n", .{ idx, numeric, analytic });
+        if (@abs(numeric - p.grad) >= tol) {
+            std.debug.print("gradient mismatch at {d}: numeric {d:.6} analytic {d:.6}\n", .{ p.idx, numeric, p.grad });
             return error.GradientMismatch;
         }
     }
@@ -857,7 +749,7 @@ test "repeated backward passes are identical (scratch is not carried over)" {
     const cfg = model_mod.Config{ .n_layer = 2, .n_head = 2, .n_embd = 16, .block_size = 4, .vocab_size = 8 };
     var m = try Model.initRandom(allocator, cfg, "abcdefgh", 77);
     defer m.deinit();
-    var s = try Session.init(allocator, &m, 2);
+    const s = try Session.init(allocator, &m, 2);
     defer s.deinit();
 
     const T = 4;
@@ -865,18 +757,15 @@ test "repeated backward passes are identical (scratch is not carried over)" {
     const targets = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 0 };
 
     s.zeroGrads();
-    const first_loss = s.fwdBwd(&tokens, &targets, T);
-    const first = try allocator.dupe(f32, s.grads);
-    defer allocator.free(first);
+    const first_loss = try s.fwdBwd(&tokens, &targets, T);
+    const first_norm = try s.gradNorm();
 
     var iter: usize = 0;
     while (iter < 4) : (iter += 1) {
         s.zeroGrads();
-        const again = s.fwdBwd(&tokens, &targets, T);
+        const again = try s.fwdBwd(&tokens, &targets, T);
         try testing.expectApproxEqAbs(first_loss, again, 1e-6);
-        for (first, s.grads) |a, b| {
-            try testing.expectApproxEqAbs(a, b, 1e-6 * @max(@abs(a), 1.0));
-        }
+        try testing.expectApproxEqAbs(first_norm, try s.gradNorm(), 1e-6 * @max(first_norm, 1.0));
     }
 }
 
@@ -888,23 +777,21 @@ test "one optimisation step reduces the loss" {
     const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_embd = 16, .block_size = 8, .vocab_size = 6 };
     var m = try Model.initRandom(allocator, cfg, "abcdef", 5);
     defer m.deinit();
-    var s = try Session.init(allocator, &m, 2);
+    const s = try Session.init(allocator, &m, 2);
     defer s.deinit();
-    var opt = try OptState.init(allocator, m.blob.len);
-    defer opt.deinit(allocator);
 
     const tokens = [_]u32{ 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3 };
     const targets = [_]u32{ 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4 };
 
-    const before = s.lossOnly(&tokens, &targets, 8);
+    const before = try s.lossOnly(&tokens, &targets, 8);
     var i: usize = 0;
     while (i < 20) : (i += 1) {
         s.zeroGrads();
-        _ = s.fwdBwd(&tokens, &targets, 8);
-        _ = s.clipGrads(1.0);
-        s.adamStep(&opt, 3e-3, 0.0, 0.9, 0.99);
+        _ = try s.fwdBwd(&tokens, &targets, 8);
+        _ = try s.clipGrads(1.0);
+        try s.adamStep(3e-3, 0.0, 0.9, 0.99);
     }
-    const after = s.lossOnly(&tokens, &targets, 8);
+    const after = try s.lossOnly(&tokens, &targets, 8);
     try testing.expect(after < before);
 }
 
@@ -916,7 +803,7 @@ test "cached decoding matches a full forward pass (greedy)" {
     const cfg = model_mod.Config{ .n_layer = 2, .n_head = 2, .n_embd = 16, .block_size = 16, .vocab_size = 8 };
     var m = try Model.initRandom(allocator, cfg, "abcdefgh", 21);
     defer m.deinit();
-    var s = try Session.init(allocator, &m, 1);
+    const s = try Session.init(allocator, &m, 1);
     defer s.deinit();
 
     const prompt = [_]u32{ 1, 2, 3, 4, 5 };
@@ -935,8 +822,9 @@ test "cached decoding matches a full forward pass (greedy)" {
     var reference: std.ArrayList(u32) = .empty;
     defer reference.deinit(allocator);
     for (0..n_new) |_| {
-        s.forward(ctx.items, ctx.items.len);
-        const row = s.logits[(ctx.items.len - 1) * cfg.vocab_size ..][0..cfg.vocab_size];
+        const logits = try s.logitsAlloc(allocator, ctx.items, ctx.items.len);
+        defer allocator.free(logits);
+        const row = logits[(ctx.items.len - 1) * cfg.vocab_size ..][0..cfg.vocab_size];
         var best: u32 = 0;
         for (row, 0..) |v, i| {
             if (v > row[best]) best = @intCast(i);
@@ -948,6 +836,26 @@ test "cached decoding matches a full forward pass (greedy)" {
     try testing.expectEqualSlices(u32, reference.items, cached.items);
 }
 
+test "a training-batch session can still sample" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_embd = 8, .block_size = 8, .vocab_size = 6 };
+    var m = try Model.initRandom(allocator, cfg, "abcdef", 13);
+    defer m.deinit();
+    // Decode always uses the single-row path, even on a session sized for
+    // training batches (the CLI samples during training this way).
+    const s = try Session.init(allocator, &m, 4);
+    defer s.deinit();
+
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(allocator);
+    try s.generate(allocator, &[_]u32{ 1, 2 }, 5, .{ .temperature = 0.8, .top_k = 4, .seed = 2 }, null, &out);
+    try testing.expectEqual(@as(usize, 5), out.items.len);
+    for (out.items) |t| try testing.expect(t < cfg.vocab_size);
+}
+
 test "generate streams the requested number of tokens" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -956,7 +864,7 @@ test "generate streams the requested number of tokens" {
     const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_embd = 8, .block_size = 8, .vocab_size = 6 };
     var m = try Model.initRandom(allocator, cfg, "abcdef", 11);
     defer m.deinit();
-    var s = try Session.init(allocator, &m, 1);
+    const s = try Session.init(allocator, &m, 1);
     defer s.deinit();
 
     var out: std.ArrayList(u32) = .empty;

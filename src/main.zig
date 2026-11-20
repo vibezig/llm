@@ -166,10 +166,8 @@ fn cmdTrain(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Write
     defer gpa.free(val_ids);
     if (train_ids.len < T + 1 or val_ids.len < T + 1) return error.CorpusTooSmall;
 
-    var s = try gpt.Session.init(gpa, &m, batch);
+    const s = try gpt.Session.init(gpa, &m, batch);
     defer s.deinit();
-    var opt = try gpt.OptState.init(gpa, m.blob.len);
-    defer opt.deinit(gpa);
 
     var tokens = try gpa.alloc(u32, batch * T);
     defer gpa.free(tokens);
@@ -210,9 +208,9 @@ fn cmdTrain(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Write
         }
 
         s.zeroGrads();
-        const loss = s.fwdBwd(tokens, targets, T);
-        const norm = s.clipGrads(1.0);
-        s.adamStep(&opt, cur_lr, wd, 0.9, 0.99);
+        const loss = try s.fwdBwd(tokens, targets, T);
+        const norm = try s.clipGrads(1.0);
+        try s.adamStep(cur_lr, wd, 0.9, 0.99);
         tokens_seen += batch * T;
 
         if (step % 10 == 0 or step == steps - 1) {
@@ -231,14 +229,14 @@ fn cmdTrain(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Write
                 @memcpy(val_tokens[b * T ..][0..T], val_ids[start..][0..T]);
                 @memcpy(val_targets[b * T ..][0..T], val_ids[start + 1 ..][0..T]);
             }
-            const val_loss = s.lossOnly(val_tokens, val_targets, T);
+            const val_loss = try s.lossOnly(val_tokens, val_targets, T);
             try out.print("   val loss {d:.4}\n", .{val_loss});
             try out.flush();
         }
 
         if (sample_every > 0 and (step + 1) % sample_every == 0) {
             try out.writeAll("   sample: ");
-            try sampleInto(gpa, &s, tk, "ROMEO:", 48, seed +% step, out);
+            try sampleInto(gpa, s, tk, "ROMEO:", 48, seed +% step, out);
             try out.writeAll("\n");
             try out.flush();
         }
@@ -361,7 +359,7 @@ const Flags = struct {
     }
 };
 
-/// Monotonic clock reading in nanoseconds (Zig 0.17 uses `std.Io` clocks).
+/// Monotonic clock reading in nanoseconds (uses `std.Io` clocks).
 fn nowNs(io: std.Io) i96 {
     return std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
 }

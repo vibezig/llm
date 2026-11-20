@@ -48,7 +48,7 @@ pub fn serve(gpa: std.mem.Allocator, io: std.Io, model_path: []const u8, port: u
             try out.flush();
             continue;
         };
-        const ctx = Conn{ .io = io, .gpa = gpa, .model = &m, .session = &session, .stream = st, .log = out };
+        const ctx = Conn{ .io = io, .gpa = gpa, .model = &m, .session = session, .stream = st, .log = out };
         ctx.handle() catch |e| {
             try out.print("request failed: {t}\n", .{e});
             try out.flush();
@@ -145,7 +145,6 @@ const Conn = struct {
         return sendJson(req, body);
     }
 };
-
 
 const Mode = enum { chat, text };
 
@@ -295,7 +294,6 @@ fn buildPrompt(arena: std.mem.Allocator, p: *const Params, mode: Mode) ![]const 
     return list.items;
 }
 
-
 fn fullCompletion(self: Conn, req: *std.http.Server.Request, mode: Mode, params: *const Params, prompt_ids: []const u32) !void {
     var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(self.gpa);
@@ -341,7 +339,6 @@ fn nowSeconds(io: std.Io) i64 {
     return @intCast(@divFloor(ns, std.time.ns_per_s));
 }
 
-
 fn streamCompletion(self: Conn, req: *std.http.Server.Request, mode: Mode, params: *const Params, prompt_ids: []const u32) !void {
     var body_buf: [8192]u8 = undefined;
     var bw = try req.respondStreaming(&body_buf, .{
@@ -375,7 +372,6 @@ fn streamCompletion(self: Conn, req: *std.http.Server.Request, mode: Mode, param
     try w.flush();
     try bw.end();
 }
-
 
 /// Emits OpenAI-style SSE frames. Chat mode uses `delta`, text mode uses `text`.
 const SseOut = struct {
@@ -440,7 +436,9 @@ const SseOut = struct {
     }
 
     fn emitDone(self: *SseOut) !void {
-        try self.w.writeAll(DONE); try self.w.writeByte(10); try self.w.writeByte(10);
+        try self.w.writeAll(DONE);
+        try self.w.writeByte(10);
+        try self.w.writeByte(10);
         try self.w.flush();
     }
 };
@@ -461,23 +459,41 @@ const StreamCtx = struct {
 
     fn feed(self: *StreamCtx, b: u8, out: *[4]u8) ?[]const u8 {
         if (self.need == 0) {
-            if (b < 0x80) { out[0] = b; return out[0..1]; }
+            if (b < 0x80) {
+                out[0] = b;
+                return out[0..1];
+            }
             const n: u8 = if (b >= 0xC2 and b <= 0xDF) 2 else if (b >= 0xE0 and b <= 0xEF) 3 else if (b >= 0xF0 and b <= 0xF4) 4 else 0;
-            if (n == 0) { _ = bad(out); return out[0..3]; }
-            self.pending[0] = b; self.len = 1; self.need = n; return null;
+            if (n == 0) {
+                _ = bad(out);
+                return out[0..3];
+            }
+            self.pending[0] = b;
+            self.len = 1;
+            self.need = n;
+            return null;
         }
-        if (b < 0x80 or b > 0xBF) { self.len = 0; self.need = 0; _ = bad(out); return out[0..3]; }
-        self.pending[self.len] = b; self.len += 1;
+        if (b < 0x80 or b > 0xBF) {
+            self.len = 0;
+            self.need = 0;
+            _ = bad(out);
+            return out[0..3];
+        }
+        self.pending[self.len] = b;
+        self.len += 1;
         if (self.len < self.need) return null;
         const n2 = self.len;
         @memcpy(out[0..n2], self.pending[0..n2]);
-        self.len = 0; self.need = 0;
+        self.len = 0;
+        self.need = 0;
         return out[0..n2];
     }
 };
 
 fn bad(out: *[4]u8) [3]u8 {
-    out[0] = 0xEF; out[1] = 0xBF; out[2] = 0xBD;
+    out[0] = 0xEF;
+    out[1] = 0xBF;
+    out[2] = 0xBD;
     return .{ 0xEF, 0xBF, 0xBD };
 }
 
@@ -528,21 +544,32 @@ fn decodeBytes(gpa: std.mem.Allocator, vocab: []const u8, ids: []const u32) ![]u
     for (ids) |id| {
         const b: u8 = if (id < vocab.len) vocab[id] else '?';
         if (need == 0) {
-            if (b < 0x80) { try out.append(gpa, b); continue; }
+            if (b < 0x80) {
+                try out.append(gpa, b);
+                continue;
+            }
             const n: u8 = if (b >= 0xC2 and b <= 0xDF) 2 else if (b >= 0xE0 and b <= 0xEF) 3 else if (b >= 0xF0 and b <= 0xF4) 4 else 0;
-            if (n == 0) { try out.appendSlice(gpa, repl); continue; }
-            pend[0] = b; len = 1; need = n;
+            if (n == 0) {
+                try out.appendSlice(gpa, repl);
+                continue;
+            }
+            pend[0] = b;
+            len = 1;
+            need = n;
             continue;
         }
         if (b < 0x80 or b > 0xBF) {
             try out.appendSlice(gpa, repl);
-            len = 0; need = 0;
+            len = 0;
+            need = 0;
             continue;
         }
-        pend[len] = b; len += 1;
+        pend[len] = b;
+        len += 1;
         if (len < need) continue;
         try out.appendSlice(gpa, pend[0..len]);
-        len = 0; need = 0;
+        len = 0;
+        need = 0;
     }
     if (len > 0) try out.appendSlice(gpa, repl);
     return out.toOwnedSlice(gpa);

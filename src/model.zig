@@ -2,9 +2,10 @@
 //!
 //! A model is a flat `f32` blob plus a registry that names every tensor and
 //! records its offset/shape. Keeping one blob means:
-//!   * gradients and optimizer state are the same size and layout (offsets are
-//!     shared, so `grad[i]` always belongs to `param[i]`);
-//!   * a checkpoint is a header + one `write` of the blob.
+//!   * a checkpoint is a header + one `write` of the blob;
+//!   * Fucina can borrow each registry slice as a variable in place, so the
+//!     optimizer updates the checkpoint blob directly;
+//!   * the layout is stable across sessions and tools (`info`, `gen`, `train`).
 //!
 //! `.vzm` layout (little-endian):
 //!
@@ -22,7 +23,6 @@
 //!       name_len u32, name [name_len]u8, rows u32, cols u32, dtype u32(0 = f32)
 //!   blob        [total_floats]f32
 const std = @import("std");
-const tensor = @import("tensor.zig");
 
 pub const magic = "VZLM";
 pub const version: u32 = 1;
@@ -136,24 +136,24 @@ pub const Model = struct {
         const c: usize = cfg.n_embd;
         const residual_std = 0.02 / @sqrt(2.0 * @as(f32, @floatFromInt(cfg.n_layer)));
 
-        tensor.normal(r, self.view(self.layout.wte), 0, 0.02);
-        tensor.normal(r, self.view(self.layout.wpe), 0, 0.01);
+        normalSlice(r, self.view(self.layout.wte), 0, 0.02);
+        normalSlice(r, self.view(self.layout.wpe), 0, 0.01);
         for (self.layout.layers, 0..) |lo, i| {
             _ = i;
-            tensor.fill(self.view(lo.ln1g), 1.0);
-            tensor.fill(self.view(lo.ln1b), 0.0);
-            tensor.normal(r, self.view(lo.wq), 0, 0.02);
-            tensor.normal(r, self.view(lo.wk), 0, 0.02);
-            tensor.normal(r, self.view(lo.wv), 0, 0.02);
-            tensor.normal(r, self.view(lo.wo), 0, residual_std);
-            tensor.fill(self.view(lo.ln2g), 1.0);
-            tensor.fill(self.view(lo.ln2b), 0.0);
-            tensor.normal(r, self.view(lo.fc), 0, 0.02);
-            tensor.normal(r, self.view(lo.proj), 0, residual_std);
+            fillSlice(self.view(lo.ln1g), 1.0);
+            fillSlice(self.view(lo.ln1b), 0.0);
+            normalSlice(r, self.view(lo.wq), 0, 0.02);
+            normalSlice(r, self.view(lo.wk), 0, 0.02);
+            normalSlice(r, self.view(lo.wv), 0, 0.02);
+            normalSlice(r, self.view(lo.wo), 0, residual_std);
+            fillSlice(self.view(lo.ln2g), 1.0);
+            fillSlice(self.view(lo.ln2b), 0.0);
+            normalSlice(r, self.view(lo.fc), 0, 0.02);
+            normalSlice(r, self.view(lo.proj), 0, residual_std);
             _ = c;
         }
-        tensor.fill(self.view(self.layout.lnfg), 1.0);
-        tensor.fill(self.view(self.layout.lnfb), 0.0);
+        fillSlice(self.view(self.layout.lnfg), 1.0);
+        fillSlice(self.view(self.layout.lnfb), 0.0);
     }
 
     pub fn view(self: *const Model, offset: usize) []f32 {
@@ -312,13 +312,21 @@ fn appendU32(list: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u32) !vo
     try list.appendSlice(allocator, &buf);
 }
 
+fn fillSlice(s: []f32, v: f32) void {
+    @memset(s, v);
+}
+
+fn normalSlice(rng: std.Random, s: []f32, mean: f32, stddev: f32) void {
+    for (s) |*v| v.* = mean + stddev * rng.floatNorm(f32);
+}
+
 pub fn freeRegistry(allocator: std.mem.Allocator, tensors: []TensorInfo) void {
     for (tensors) |t| allocator.free(t.name);
     allocator.free(tensors);
 }
 
-/// Canonical parameter order. Everything else (gradients, optimizer state,
-/// checkpoints) reuses these offsets.
+/// Canonical parameter order. Checkpoints reuse these offsets; Fucina borrows
+/// the same slices as its trainable variables.
 pub fn buildRegistry(allocator: std.mem.Allocator, cfg: Config) ![]TensorInfo {
     const c: usize = cfg.n_embd;
     const m: usize = cfg.mlpDim();

@@ -1,5 +1,7 @@
 .zig-cache/
 zig-out/
+# fetched package cache (Fucina); pinned by build.zig.zon
+zig-pkg/
 # trained checkpoints are outputs, never tracked: `llm gen` / `llm train` create them
 models/
 *.log
