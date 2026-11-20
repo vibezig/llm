@@ -15,7 +15,8 @@ $ llm serve                      # http://localhost:8080 — chat UI + JSON API
 ```
 
 The tokenizer is a **byte-level BPE trained on the corpus itself** (`--vocab`,
-default 1,024 tokens), not a downloaded vocabulary. The model is 437k parameters
+default 1,024 tokens), not a downloaded vocabulary. The transformer is a
+modern dense block — RMSNorm, RoPE, GQA and SwiGLU — at **403k parameters**,
 and the tokenizer blob travels inside the `.vzm` checkpoint.
 
 ---
@@ -26,8 +27,8 @@ and the tokenizer blob travels inside the `.vzm` checkpoint.
 | --- | --- | --- |
 | tensor math | `fucina` 0.5.1 | tagged f32 tensors, CPU SIMD kernels, eager autograd, AdamW |
 | checkpoint format | `src/model.zig` | config + tensor registry + weights in one flat blob (`.vzm`) |
-| tokenizer | `src/tokenizer.zig`, `src/bpe/` | corpus-trained byte-level BPE (vendored bpe.zig); char fallback for v1 |
-| transformer | `src/gpt.zig` | block wiring, KV-cached sampling; forward/backward by Fucina |
+| tokenizer | `src/tokenizer.zig`, `src/bpe/` | corpus-trained byte-level BPE (vendored bpe.zig) |
+| transformer | `src/gpt.zig` | RMSNorm + RoPE + GQA + SwiGLU; KV-cached sampling |
 | CLI | `src/main.zig` | `gen` / `train` / `infer` / `info` / `serve` |
 | server | `src/server.zig` | HTTP/1.1 API + embedded UI (SSE token stream) |
 | web UI | `src/web/index.html` | single-file chat client, compiled into the binary |
@@ -59,11 +60,13 @@ Nothing in the repo depends on a checkpoint being present.
 ## CLI
 
 ```
-llm gen   [--out models/tiny.vzm] [--layers 3] [--heads 4] [--embd 96]
-          [--block 64] [--data data/input.txt] [--vocab 1024] [--seed 1337]
+llm gen   [--out models/tiny.vzm] [--layers 3] [--heads 4] [--kv-heads 2]
+          [--embd 96] [--block 64] [--data data/input.txt] [--vocab 1024]
+          [--seed 1337]
 
 llm train [--data data/input.txt] [--out models/tiny.vzm] [--model in.vzm]
-          [--vocab 1024] [--steps 12000] [--batch 8] [--lr 0.003] [--wd 0.01]
+          [--vocab 1024] [--heads 4] [--kv-heads 2] [--steps 12000]
+          [--batch 8] [--lr 0.003] [--wd 0.01]
           [--eval-every 500] [--sample-every 1000] [--seed 1337]
 
 llm infer [--model models/tiny.vzm] [--prompt "ROMEO:"] [--tokens 200]
@@ -79,45 +82,49 @@ model — the same file format `train` and `infer` use, so a checkpoint is just
 
 ```
 model: models/tiny.vzm
-  params   437568
+  params   403104
   layers   3
-  heads    4 (head dim 24)
+  heads    4 (kv 2, head dim 24)
   embd     96
   block    64
   vocab    1024
   tokenizer bpe
-  tensors  34
+  tensors  29
   tensors:
     wte                [1024, 96]
-    wpe                [64, 96]
     h0.ln1.g           [96, 1]
     h0.attn.wq         [96, 96]
+    h0.attn.wk         [96, 48]
     ...
 ```
 
 ## The model
 
-A GPT-2-shaped decoder with pre-LN blocks and a tied output head:
+A modern pre-norm decoder with a tied output head:
 
 ```
-tokens ──► wte[idx] + wpe[pos]
+tokens ──► wte[idx]
              │
              ▼  ×n_layer
-    ┌─────────────────────────────┐
-    │ x = x + attn(ln1(x))        │   causal multi-head self-attention
-    │ x = x + mlp(ln2(x))         │   GELU, 4× hidden expansion
-    └─────────────────────────────┘
+    ┌──────────────────────────────────────┐
+    │ x = x + GQA(RoPE(RMSNorm(x)))        │   grouped-query attention
+    │ x = x + SwiGLU(RMSNorm(x))           │   gate · SiLU(up) · down
+    └──────────────────────────────────────┘
              │
              ▼
-        ln_f ──► logits = x @ wteᵀ ──► softmax ──► next token
+        RMSNorm ──► logits = x @ wteᵀ ──► softmax ──► next token
 ```
 
-Default `tiny` config: 3 layers, 4 heads, 96 dims, 64-token context, a
-corpus-trained 1,024-token BPE → **437,568 parameters** (1.7 MB). Bigger shapes
-are one flag away:
+RMSNorm has a weight and no bias; positions come from RoPE (no `wpe`);
+attention uses 4 query heads over 2 KV heads (GQA); the FFN is SwiGLU with a
+`8/3 · d` hidden size.
+
+Default `tiny` config: 3 layers, 4 heads / 2 KV heads, 96 dims, 64-token
+context, a corpus-trained 1,024-token BPE → **403,104 parameters** (1.6 MB).
+Bigger shapes are one flag away:
 
 ```bash
-./zig-out/bin/llm gen  --layers 6 --heads 6 --embd 192 --block 128 --out models/medium.vzm
+./zig-out/bin/llm gen  --layers 6 --heads 6 --kv-heads 2 --embd 192 --block 128 --out models/medium.vzm
 ./zig-out/bin/llm train --model models/medium.vzm --steps 20000 --batch 16
 ```
 
@@ -128,11 +135,11 @@ are one flag away:
 (MIT OR Apache-2.0), with the POSIX-regex pre-tokenizer replaced by a pure-Zig
 implementation. `src/bpe/train.zig` adds a corpus-trained BPE: `llm gen` starts
 from the 256 byte tokens, greedily merges the most frequent pairs until
-`--vocab` (default 1,024), and stores the vocab + merge pairs in the `.vzm` v2
+`--vocab` (default 1,024), and stores the vocab + merge pairs in the `.vzm` v3
 blob. No downloaded tokenizer, no GPT-2 vocabulary.
 
-Version-1 checkpoints carry the old 65-byte char vocab and transparently use the
-char path.
+The checkpoint format is v3 (modern block + tokenizer kind); older v1/v2
+checkpoints are not loadable and must be retrained.
 
 ### Autograd, not a hand-written tape
 
@@ -143,8 +150,8 @@ blob **in place**, so the optimizer writes straight into the checkpoint blob
 and `model.save()` needs no copy-back.
 
 The wiring is guarded by central finite differences on seven gradient buckets
-(embeddings, attention, MLP, layernorm), and cached decoding is checked
-token-for-token against a full forward pass:
+(embeddings, GQA attention + RoPE, SwiGLU, RMSNorm), and cached decoding is
+checked token-for-token against a full forward pass:
 
 ```
 test "gradients match finite differences" ... OK
@@ -164,9 +171,10 @@ Adam moments live in Fucina's per-parameter state.
 | field | type | notes |
 | --- | --- | --- |
 | magic | 4 bytes | `"VZLM"` |
-| version | u32 | `1` = char vocab, `2` = corpus-trained BPE blob |
-| n_layer, n_head, n_embd, block_size, vocab_size | 5 × u32 | model shape |
-| vocab_len, vocab | u32 + bytes | v1 byte->id table, v2 BPE vocab + merges |
+| version | u32 | `3` (modern dense block) |
+| tokenizer_kind | u32 | `1` = char, `2` = corpus-trained BPE |
+| n_layer, n_head, n_kv_head, n_embd, block_size, vocab_size | 6 × u32 | model shape |
+| vocab_len, vocab | u32 + bytes | tokenizer payload (char table or BPE blob) |
 | n_tensors | u32 | registry length |
 | per tensor: name_len, name, rows, cols, dtype | u32, bytes, u32, u32, u32 | dtype `0` = f32 |
 | blob | `total_floats × f32` | row-major, little-endian |
@@ -236,24 +244,27 @@ kernels:
 | --- | --- |
 | BPE training on 1 MB (vocab 1,024) | **~0.5 s** |
 | encode / decode (1.1 MB corpus) | ~19 MB/s / ~46 MB/s |
-| training (437k params, batch 8 × seq 64) | ~20,300 tok/s |
-| inference, KV cache, 200-token context | ~7,100 tok/s |
+| training (403k params, batch 8 × seq 64) | ~19,000–27,000 tok/s |
+| inference, KV cache, 200-token context | ~6,900 tok/s |
 
-A 500-step run takes the BPE model from loss 6.94 (random) to 4.30 and already
-produces readable fragments; 12k steps is the next benchmark. Throughput depends
-on the host CPU and the BLAS provider Fucina auto-detects (`-Dblas=openblas` /
-`mkl` / `blis` are used when installed).
+A 500-step run takes the modern model from loss 6.94 (random) to 4.02 — ahead of
+the old GPT-2 block's 4.30 at the same step count — and produces readable
+fragments. Throughput depends on the host CPU and the BLAS provider Fucina
+auto-detects (`-Dblas=openblas` / `mkl` / `blis` are used when installed).
 
 ## Limits (on purpose)
 
 This is a readable reference implementation, not a production inference stack:
 
+* **v3 checkpoints only** — the modern block changes the tensor registry; old
+  v1/v2 GPT-2 checkpoints must be retrained.
 * **encoder is O(L²) per piece** — it finds the next lowest-rank merge by
   rescanning the piece. Fine for words and prompts, but long whitespace or
   punctuation runs are quadratic; a rank-ordered linked list is the next win.
 * **f32 only** — no quantisation, no bf16/f16.
 * **one request at a time** — the server serialises generations behind the model.
 * **CPU only** — Fucina's Metal/CUDA GEMM offload is not enabled here.
+* **no MoE yet** — the dense block is the baseline; routing is a later step.
 * **pinned toolchain** — Fucina 0.5.1 requires Zig 0.16.0; a Zig upgrade waits
   for upstream.
 
@@ -268,7 +279,7 @@ zig build test
 27 tests: full-model gradients vs finite differences, backward determinism,
 "one AdamW step reduces loss", KV-cached decoding vs a full forward pass,
 sampling length/range, BPE training + blob round-trip, optimized-vs-reference
-trainer parity, `.vzm` v1/v2 round-trips and corruption rejection, plus the CLI
+trainer parity, `.vzm` v3 round-trips and corruption rejection, plus the CLI
 and server helpers.
 
 ## License

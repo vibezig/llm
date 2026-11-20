@@ -53,10 +53,12 @@ fn printHelp(out: *std.Io.Writer) !void {
         \\vibezig/llm — a fullstack LLM engine in Zig
         \\
         \\usage:
-        \\  llm gen   [--out models/tiny.vzm] [--layers 3] [--heads 4] [--embd 96]
-        \\            [--block 64] [--data data/input.txt] [--vocab 1024] [--seed 1337]
+        \\  llm gen   [--out models/tiny.vzm] [--layers 3] [--heads 4] [--kv-heads 2]
+        \\            [--embd 96] [--block 64] [--data data/input.txt] [--vocab 1024]
+        \\            [--seed 1337]
         \\  llm train [--data data/input.txt] [--out models/tiny.vzm] [--model in.vzm]
-        \\            [--vocab 1024] [--steps 3000] [--batch 8] [--lr 0.003] [--wd 0.01]
+        \\            [--vocab 1024] [--heads 4] [--kv-heads 2] [--steps 3000]
+        \\            [--batch 8] [--lr 0.003] [--wd 0.01]
         \\            [--eval-every 100] [--sample-every 250] [--seed 1337]
         \\  llm infer [--model models/tiny.vzm] [--prompt "ROMEO:"] [--tokens 200]
         \\            [--temp 0.8] [--top-k 40] [--seed 0]
@@ -92,9 +94,12 @@ fn cmdGen(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Writer)
     var tk = try tokenizer.Tokenizer.initBpeFromBlob(gpa, blob);
     errdefer tk.deinit();
 
+    const n_head = flags.getInt(u32, "heads", 4);
+    const kv_default: u32 = if (n_head >= 2) 2 else 1;
     const cfg = model_mod.Config{
         .n_layer = flags.getInt(u32, "layers", 3),
-        .n_head = flags.getInt(u32, "heads", 4),
+        .n_head = n_head,
+        .n_kv_head = flags.getInt(u32, "kv-heads", kv_default),
         .n_embd = flags.getInt(u32, "embd", 96),
         .block_size = flags.getInt(u32, "block", 64),
         .vocab_size = @intCast(tk.vocabSize()),
@@ -107,12 +112,13 @@ fn cmdGen(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Writer)
     try m.save(io, out_path);
 
     try out.print(
-        "generated model: {s}\n  params   {d}\n  layers   {d}\n  heads    {d} (head dim {d})\n  embd     {d}\n  block    {d}\n  vocab    {d}\n  bytes    {d}\n",
+        "generated model: {s}\n  params   {d}\n  layers   {d}\n  heads    {d} (kv {d}, head dim {d})\n  embd     {d}\n  block    {d}\n  vocab    {d}\n  bytes    {d}\n",
         .{
             out_path,
             m.paramCount(),
             cfg.n_layer,
             cfg.n_head,
+            cfg.n_kv_head,
             cfg.headDim(),
             cfg.n_embd,
             cfg.block_size,
@@ -153,9 +159,12 @@ fn cmdTrain(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Write
         defer gpa.free(blob);
         var tk = try tokenizer.Tokenizer.initBpeFromBlob(gpa, blob);
         errdefer tk.deinit();
+        const n_head = flags.getInt(u32, "heads", 4);
+        const kv_default: u32 = if (n_head >= 2) 2 else 1;
         const cfg = model_mod.Config{
             .n_layer = flags.getInt(u32, "layers", 3),
-            .n_head = flags.getInt(u32, "heads", 4),
+            .n_head = n_head,
+            .n_kv_head = flags.getInt(u32, "kv-heads", kv_default),
             .n_embd = flags.getInt(u32, "embd", 96),
             .block_size = flags.getInt(u32, "block", 64),
             .vocab_size = @intCast(tk.vocabSize()),
@@ -332,8 +341,8 @@ fn cmdInfo(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Writer
     defer m.deinit();
     const cfg = m.cfg;
     try out.print(
-        "model: {s}\n  params   {d}\n  layers   {d}\n  heads    {d} (head dim {d})\n  embd     {d}\n  block    {d}\n  vocab    {d}\n  tokenizer {s}\n  tensors  {d}\n",
-        .{ path, m.paramCount(), cfg.n_layer, cfg.n_head, cfg.headDim(), cfg.n_embd, cfg.block_size, cfg.vocab_size, @tagName(m.tokenizer.kind()), m.tensors.len },
+        "model: {s}\n  params   {d}\n  layers   {d}\n  heads    {d} (kv {d}, head dim {d})\n  embd     {d}\n  block    {d}\n  vocab    {d}\n  tokenizer {s}\n  tensors  {d}\n",
+        .{ path, m.paramCount(), cfg.n_layer, cfg.n_head, cfg.n_kv_head, cfg.headDim(), cfg.n_embd, cfg.block_size, cfg.vocab_size, @tagName(m.tokenizer.kind()), m.tensors.len },
     );
     try out.writeAll("  tensors:\n");
     for (m.tensors) |t| {

@@ -130,7 +130,7 @@ const Conn = struct {
         }
         var buf: [512]u8 = undefined;
         const body = try std.fmt.bufPrint(&buf,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"{s}","meta":{{"params":{d},"layers":{d},"heads":{d},"embd":{d},"block":{d},"vocab":{d}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"{s}","meta":{{"params":{d},"layers":{d},"heads":{d},"kv_heads":{d},"embd":{d},"block":{d},"vocab":{d}}}}}
         , .{
             model_id,
             self.nowSeconds(),
@@ -138,6 +138,7 @@ const Conn = struct {
             self.model.paramCount(),
             self.model.cfg.n_layer,
             self.model.cfg.n_head,
+            self.model.cfg.n_kv_head,
             self.model.cfg.n_embd,
             self.model.cfg.block_size,
             self.model.cfg.vocab_size,

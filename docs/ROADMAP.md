@@ -19,8 +19,8 @@ measuring the providers:
 3. **Quantized weights** — Fucina has q8_0/q4_K block-quantized RHS kernels. A
    second dtype in `.vzm` (`dtype = 1`) plus the loader would shrink the
    checkpoint and speed up the memory-bound decode shapes.
-4. **Larger models** — the current BPE model is 437k parameters; the next
-   meaningful speed test is a model whose weights stream from RAM.
+4. **Larger models** — the current modern BPE model is 403k parameters; the
+   next meaningful speed test is a model whose weights stream from RAM.
 
 ## Model quality
 
@@ -30,23 +30,26 @@ measuring the providers:
 6. **Encoder linked-list merges** — merging still rescans the piece for the
    lowest-rank pair (O(L²)). A rank-ordered linked list would help long
    whitespace/punctuation runs; short words are already fast.
-7. **Chat/instruction format** — `/v1/chat/completions` wraps messages in
+7. **MoE-lite** — once data/model scale justifies it (~100 MB+, 10M+ params):
+   one shared expert + 8 routed experts, top-2, SwiGLU, aux load-balancing.
+   Keep RMSNorm/RoPE/GQA. The current 1 MB corpus is far too small for routing.
+8. **Chat/instruction format** — `/v1/chat/completions` wraps messages in
    `user:`/`assistant:`, a format the raw-text model never saw. Either pass the
    last user message through raw for this model, or fine-tune on a role-tagged
    corpus.
-8. **Multi-file corpus loader** — walk a directory, concatenate with document
+9. **Multi-file corpus loader** — walk a directory, concatenate with document
    separators, shuffle document order per epoch.
-9. **Checkpoint resume** — Fucina's AdamW can `saveState`/`loadState`; persist
-   that next to the weights so a 12k-step run can be interrupted without a cold
-   start.
-10. **Dropout + faster LR schedules** — trivially useful once the model grows
+10. **Checkpoint resume** — Fucina's AdamW can `saveState`/`loadState`; persist
+    that next to the weights so a 12k-step run can be interrupted without a cold
+    start.
+11. **Dropout + faster LR schedules** — trivially useful once the model grows
     past ~10M parameters where overfitting starts to bite.
 
 ## Engineering
 
-11. **Concurrent server** — a worker thread per connection with a session pool
+12. **Concurrent server** — a worker thread per connection with a session pool
     instead of the current serial accept loop, plus a mutex per session.
-12. **Graceful shutdown + `SIGINT`** — needed to run under a supervisor.
-13. **HTTP keep-alive and `Content-Length` on the streaming route** — lets
+13. **Graceful shutdown + `SIGINT`** — needed to run under a supervisor.
+14. **HTTP keep-alive and `Content-Length` on the streaming route** — lets
     reverse proxies (nginx, Cloudflare) buffer predictably.
-14. **`llm export --format gguf`** — interop with the wider tooling ecosystem.
+15. **`llm export --format gguf`** — interop with the wider tooling ecosystem.

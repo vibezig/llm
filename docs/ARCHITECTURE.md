@@ -20,9 +20,10 @@ longer share the blob's layout. Adding a tensor means adding it to
 registry test asserts offsets stay contiguous.
 
 The checkpoint also carries the tokenizer bytes (`vocab_len`/`vocab`): a raw
-byte->id table for v1 char models, or the compact BPE vocab+merge blob for v2.
+byte->id table for the char tokenizer, or the compact BPE vocab+merge blob.
 `Model` parses it into a `Tokenizer` at load time, so a checkpoint is
-self-contained. Both versions remain readable.
+self-contained. Version 3 is the current format (modern block); older v1/v2
+GPT-2 checkpoints are not loadable.
 
 `Session` is heap-allocated because Fucina pins an `ExecContext` after `init`
 (the embedded allocator points at itself) and the optimizer retains pointers to
@@ -36,10 +37,12 @@ kernels in this repository.
 
 The model uses:
 
-* `.plain` matmul for `[rows, in] @ [in, out]` weights (qkv, MLP, output
+* `.plain` matmul for `[rows, in] @ [in, out]` weights (qkv, SwiGLU, output
   projection), matching the `.vzm` row-major `[in, out]` layout;
 * `.trans_b` for the tied head: `[rows, embed] @ [vocab, embed]ᵀ`;
-* fused `layerNorm`, `gelu` and `crossEntropy` ops, each with its own VJP.
+* fused `rmsNormMul`, `rope`, `swiglu` and `crossEntropy` ops, each with its own
+  VJP;
+* Fucina's causal `groupedAttention` with an explicit query-head → KV-head map.
 
 Fucina selects a CBLAS provider at build time (`-Dblas=openblas|mkl|blis|nvpl`)
 and otherwise uses its portable Zig vector kernels. The dependency and its
@@ -48,32 +51,38 @@ version are pinned in `build.zig.zon`.
 ## 3. Forward pass
 
 Tokens come from the model's tokenizer: a byte-level BPE trained on the corpus
-(`src/bpe/`, using bpe.zig's encoder and a pure-Zig trainer), or the legacy char
-path for v1 checkpoints. The trainer is incremental — symbols are a doubly
-linked list, each adjacent pair has an intrusive position list, and a max-heap
-selects the next merge — so a merge touches only that pair's occurrences
-(1 MB / vocab 1,024 trains in ~0.5 s). Tokens and positions are gathered into a
-`[batch*seq, model]` stream (row `r = b*T + t`). Per layer:
+(`src/bpe/`, using bpe.zig's encoder and a pure-Zig trainer). The trainer is
+incremental — symbols are a doubly linked list, each adjacent pair has an
+intrusive position list, and a max-heap selects the next merge — so a merge
+touches only that pair's occurrences (1 MB / vocab 1,024 trains in ~0.5 s).
+Tokens are gathered into a `[batch*seq, model]` stream (row `r = b*T + t`); RoPE
+uses the matching per-row positions. Per layer:
 
 ```
-x  := LN1(x)
-q  := x @ Wq ; k := x @ Wk ; v := x @ Wv
-O  := causalAttention(q, k, v)        # per batch row, all heads at once
+x  := RMSNorm1(x)
+q  := x @ Wq ; k := x @ Wk ; v := x @ Wv        # Wk/Wv are [d, n_kv_head·hd]
+q  := RoPE(q) ; k := RoPE(k)
+O  := causalGQA(q, k, v)                        # per batch row, H q heads
 x  := x + O @ Wo
-y  := LN2(x)
-h  := GELU(y @ Wfc)
-x  := x + h @ Wproj
+y  := RMSNorm2(x)
+gate := y @ W1 ; up := y @ W3
+h  := up · SiLU(gate)                           # SwiGLU
+x  := x + h @ W2
 ```
+
+`Wq`/`Wo` are `d×d`; `Wk`/`Wv` project to `n_kv_head·head_dim`, and the GQA map
+assigns each query head to a KV head (`h * n_kv_head / n_head`). RoPE is applied
+to q and k after the head split, with `.half` (NeoX) rotation.
 
 Attention is the only place the batch axis is explicit: q/k/v are projected for
-all rows in one matmul, then each batch row is narrowed, split to
-`[seq, head, d]`, passed through Fucina's causal `groupedAttention`, and
-concatenated back along `.seq`. That keeps one weight read per projection while
-respecting per-sequence causality.
+all rows in one matmul, RoPE runs once, then each batch row is narrowed, passed
+through Fucina's causal `groupedAttention`, and concatenated back along `.seq`.
+That keeps one weight read per projection while respecting per-sequence
+causality.
 
-The final `LN_f` and `logits = x @ wteᵀ` close the pass. The embedding matrix is
-tied: it is both the lookup table and the output projection, and Fucina
-accumulates both gradient contributions into the same variable.
+The final `RMSNorm_f` and `logits = x @ wteᵀ` close the pass. The embedding
+matrix is tied: it is both the lookup table and the output projection, and
+Fucina accumulates both gradient contributions into the same variable.
 
 ## 4. Backward pass
 
@@ -84,8 +93,8 @@ updates the borrowed blob, and `zeroGrad` clears the leaves for the next step.
 This repository no longer implements VJPs. It guards the model **wiring** with:
 
 * **numerical agreement** — perturb individual parameters of embedding /
-  attention / MLP / layernorm tensors and compare the analytic gradient with
-  central finite differences;
+  GQA attention / SwiGLU / RMSNorm tensors and compare the analytic gradient
+  with central finite differences;
 * **determinism** — repeated forward/backward passes must reproduce the loss and
   grad norm exactly;
 * **progress** — 20 AdamW steps must reduce the loss;

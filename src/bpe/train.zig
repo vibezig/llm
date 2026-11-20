@@ -2,7 +2,7 @@
 //!
 //! This is not part of upstream bpe.zig (which only loads a tokenizer). It
 //! learns merges on a corpus with the same pre-tokenization the encoder uses,
-//! then emits the compact `.vzm` v2 blob consumed by `Tokenizer.initFromBlob`.
+//! then emits the compact `.vzm` v3 tokenizer blob consumed by `Tokenizer.initFromBlob`.
 //!
 //! The trainer is incremental: symbols live in a doubly linked list, every
 //! adjacent pair is in an intrusive position list, and a max-heap over pair

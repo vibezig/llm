@@ -3,7 +3,7 @@
 //! Core algorithms vendored from https://github.com/alvarobartt/bpe.zig
 //! (MIT OR Apache-2.0), ported to Zig 0.16, with the POSIX-regex pre-tokenizer
 //! replaced by `pre_tokenize.zig`. The JSON loader is replaced by a compact
-//! `.vzm` v2 blob (`initFromBlob` / `serializeBlob`) fed by the pure-Zig
+//! `.vzm` v3 tokenizer blob (`initFromBlob` / `serializeBlob`) fed by the pure-Zig
 //! trainer in `train.zig`.
 const std = @import("std");
 const Pair = @import("pair.zig").Pair;
@@ -227,7 +227,7 @@ pub const Tokenizer = struct {
         return self.decodeInto(&.{id}, out);
     }
 
-    /// Serialize the ordered vocab and merge pairs to the `.vzm` v2 blob.
+    /// Serialize the ordered vocab and merge pairs to the `.vzm` v3 tokenizer blob.
     pub fn serializeBlob(allocator: std.mem.Allocator, vocab: []const []const u8, merges: []const Merge) ![]u8 {
         if (vocab.len != base_vocab_size + merges.len) return Error.InvalidVocab;
         if (vocab.len > std.math.maxInt(u32)) return Error.TooManyTokens;

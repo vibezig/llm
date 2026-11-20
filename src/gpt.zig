@@ -1,14 +1,8 @@
-//! The transformer, now expressed on Fucina's eager autograd runtime.
+//! The transformer on Fucina: dense modern block.
 //!
-//! Architecture is unchanged: GPT-2 small-shaped, pre-LN blocks, causal
-//! multi-head self-attention, GELU MLP with 4x expansion, learned position
-//! embeddings and a tied output head (`logits = x @ wte^T`).
-//!
-//! Every parameter is a Fucina `variable` that borrows its slice of
-//! `Model.blob` in place, so the `.vzm` checkpoint stays the single source of
-//! truth: the optimizer updates the blob directly and `Model.save` needs no
-//! copy-back. Forward, backward and AdamW are Fucina's; this file only states
-//! the block wiring.
+//! Architecture: pre-norm decoder with RMSNorm, RoPE, GQA and a SwiGLU FFN.
+//! Every parameter is a Fucina `variable` borrowing its slice of `Model.blob`,
+//! so the `.vzm` checkpoint is the single source of truth.
 const std = @import("std");
 const fucina = @import("fucina");
 const model_mod = @import("model.zig");
@@ -17,15 +11,18 @@ const Model = model_mod.Model;
 const ExecContext = fucina.ExecContext;
 const optim = fucina.optim;
 
-/// LayerNorm epsilon, matching the original local kernels.
+/// RMSNorm epsilon.
 pub const eps: f32 = 1e-5;
+/// RoPE base.
+pub const rope_theta: f32 = 10000.0;
 
 const Emb = fucina.Tensor(.{ .vocab, .model });
-const PosEmb = fucina.Tensor(.{ .pos, .model });
 /// Any 2-D weight, stored [in, out] as in the `.vzm` registry.
 const Mat = fucina.Tensor(.{ .in, .out });
 const Norm = fucina.Tensor(.{.model});
 const Stream = fucina.Tensor(.{ .seq, .model });
+const HeadStream = fucina.Tensor(.{ .seq, .head, .d });
+const KvStream = fucina.Tensor(.{ .seq, .kv_head, .d });
 const AttnStream = fucina.Tensor(.{ .seq, .attn });
 const Logits = fucina.Tensor(.{ .seq, .vocab });
 
@@ -36,11 +33,6 @@ pub const SampleParams = struct {
 };
 
 /// Per-layer key/value cache for autoregressive decoding.
-///
-/// K and V for already-seen positions never change, so decoding a new token only
-/// computes one row of q/k/v and attends over the cache: O(T) instead of O(T²)
-/// per token. The cache is plain host memory; Fucina reads it through a
-/// borrowed zero-copy view.
 pub const KvCache = struct {
     k: [][]f32,
     v: [][]f32,
@@ -49,7 +41,7 @@ pub const KvCache = struct {
 
     pub fn init(allocator: std.mem.Allocator, cfg: model_mod.Config) !KvCache {
         const L: usize = cfg.n_layer;
-        const len: usize = cfg.block_size * cfg.n_embd;
+        const len: usize = cfg.block_size * cfg.kvDim();
         const k = try layerBufs(allocator, L, len);
         errdefer {
             for (k) |b| allocator.free(b);
@@ -81,97 +73,85 @@ pub const TokenSink = struct {
     }
 };
 
-/// One transformer layer's trainable leaves, borrowed from the model blob.
 const LayerParams = struct {
     ln1g: Norm,
-    ln1b: Norm,
     wq: Mat,
     wk: Mat,
     wv: Mat,
     wo: Mat,
     ln2g: Norm,
-    ln2b: Norm,
-    fc: Mat,
-    proj: Mat,
+    w1: Mat,
+    w3: Mat,
+    w2: Mat,
 
     fn init(ctx: *ExecContext, model: *const Model, l: usize) !LayerParams {
         const cfg = model.cfg;
         const c: usize = cfg.n_embd;
         const m: usize = cfg.mlpDim();
+        const kv: usize = cfg.kvDim();
         const lo = model.layout.layers[l];
         const b = model.blob;
 
         var ln1g = try varFrom(Norm, ctx, .{c}, b, lo.ln1g, c);
         errdefer ln1g.deinit();
-        var ln1b = try varFrom(Norm, ctx, .{c}, b, lo.ln1b, c);
-        errdefer ln1b.deinit();
         var wq = try varFrom(Mat, ctx, .{ c, c }, b, lo.wq, c * c);
         errdefer wq.deinit();
-        var wk = try varFrom(Mat, ctx, .{ c, c }, b, lo.wk, c * c);
+        var wk = try varFrom(Mat, ctx, .{ c, kv }, b, lo.wk, c * kv);
         errdefer wk.deinit();
-        var wv = try varFrom(Mat, ctx, .{ c, c }, b, lo.wv, c * c);
+        var wv = try varFrom(Mat, ctx, .{ c, kv }, b, lo.wv, c * kv);
         errdefer wv.deinit();
         var wo = try varFrom(Mat, ctx, .{ c, c }, b, lo.wo, c * c);
         errdefer wo.deinit();
         var ln2g = try varFrom(Norm, ctx, .{c}, b, lo.ln2g, c);
         errdefer ln2g.deinit();
-        var ln2b = try varFrom(Norm, ctx, .{c}, b, lo.ln2b, c);
-        errdefer ln2b.deinit();
-        var fc = try varFrom(Mat, ctx, .{ c, m }, b, lo.fc, c * m);
-        errdefer fc.deinit();
-        var proj = try varFrom(Mat, ctx, .{ m, c }, b, lo.proj, m * c);
-        errdefer proj.deinit();
+        var w1 = try varFrom(Mat, ctx, .{ c, m }, b, lo.w1, c * m);
+        errdefer w1.deinit();
+        var w3 = try varFrom(Mat, ctx, .{ c, m }, b, lo.w3, c * m);
+        errdefer w3.deinit();
+        var w2 = try varFrom(Mat, ctx, .{ m, c }, b, lo.w2, m * c);
+        errdefer w2.deinit();
 
         return .{
             .ln1g = ln1g,
-            .ln1b = ln1b,
             .wq = wq,
             .wk = wk,
             .wv = wv,
             .wo = wo,
             .ln2g = ln2g,
-            .ln2b = ln2b,
-            .fc = fc,
-            .proj = proj,
+            .w1 = w1,
+            .w3 = w3,
+            .w2 = w2,
         };
     }
 
     fn deinit(self: *LayerParams) void {
-        self.proj.deinit();
-        self.fc.deinit();
-        self.ln2b.deinit();
+        self.w2.deinit();
+        self.w3.deinit();
+        self.w1.deinit();
         self.ln2g.deinit();
         self.wo.deinit();
         self.wv.deinit();
         self.wk.deinit();
         self.wq.deinit();
-        self.ln1b.deinit();
         self.ln1g.deinit();
     }
 };
 
 const Params = struct {
     wte: Emb,
-    wpe: PosEmb,
     lnfg: Norm,
-    lnfb: Norm,
     layers: []LayerParams,
 
     fn init(allocator: std.mem.Allocator, ctx: *ExecContext, model: *const Model) !Params {
         const cfg = model.cfg;
         const c: usize = cfg.n_embd;
         const v: usize = cfg.vocab_size;
-        const t: usize = cfg.block_size;
         const b = model.blob;
 
         var wte = try varFrom(Emb, ctx, .{ v, c }, b, model.layout.wte, v * c);
         errdefer wte.deinit();
-        var wpe = try varFrom(PosEmb, ctx, .{ t, c }, b, model.layout.wpe, t * c);
-        errdefer wpe.deinit();
         var lnfg = try varFrom(Norm, ctx, .{c}, b, model.layout.lnfg, c);
         errdefer lnfg.deinit();
-        var lnfb = try varFrom(Norm, ctx, .{c}, b, model.layout.lnfb, c);
-        errdefer lnfb.deinit();
 
         const layers = try allocator.alloc(LayerParams, cfg.n_layer);
         var built: usize = 0;
@@ -183,25 +163,22 @@ const Params = struct {
             layers[built] = try LayerParams.init(ctx, model, built);
         }
 
-        return .{ .wte = wte, .wpe = wpe, .lnfg = lnfg, .lnfb = lnfb, .layers = layers };
+        return .{ .wte = wte, .lnfg = lnfg, .layers = layers };
     }
 
     fn deinit(self: *Params) void {
         // The slice itself is freed by the owning Session.
         for (self.layers) |*lp| lp.deinit();
-        self.lnfb.deinit();
         self.lnfg.deinit();
-        self.wpe.deinit();
         self.wte.deinit();
     }
 };
 
 /// A training or inference session over one `Model`.
 ///
-/// Heap-allocated because Fucina's `ExecContext` is pinned after `init` (it is
-/// self-referential) and the optimizer retains pointers to the parameter
-/// fields; returning it by value would move both. The model must outlive the
-/// session: every parameter borrows a slice of `model.blob`.
+/// Heap-allocated because Fucina's `ExecContext` is pinned after `init` and the
+/// optimizer retains pointers to the parameter fields. The model must outlive
+/// the session: every parameter borrows a slice of `model.blob`.
 pub const Session = struct {
     allocator: std.mem.Allocator,
     model: *Model,
@@ -243,9 +220,11 @@ pub const Session = struct {
         errdefer self.adam.deinit();
         try self.registerParams();
 
-        self.head_map = try allocator.alloc(usize, model.cfg.n_head);
+        const h: usize = model.cfg.n_head;
+        const kvh: usize = model.cfg.n_kv_head;
+        self.head_map = try allocator.alloc(usize, h);
         errdefer allocator.free(self.head_map);
-        for (self.head_map, 0..) |*h, i| h.* = i;
+        for (self.head_map, 0..) |*slot, i| slot.* = i * kvh / h;
 
         self.logits = try allocator.alloc(f32, model.cfg.vocab_size);
         return self;
@@ -265,20 +244,17 @@ pub const Session = struct {
     fn registerParams(self: *Session) !void {
         const p = &self.params;
         try self.adam.addParam(&p.wte);
-        try self.adam.addParam(&p.wpe);
         try self.adam.addParam(&p.lnfg);
-        try self.adam.addParam(&p.lnfb);
         for (p.layers) |*lp| {
             try self.adam.addParam(&lp.ln1g);
-            try self.adam.addParam(&lp.ln1b);
             try self.adam.addParam(&lp.wq);
             try self.adam.addParam(&lp.wk);
             try self.adam.addParam(&lp.wv);
             try self.adam.addParam(&lp.wo);
             try self.adam.addParam(&lp.ln2g);
-            try self.adam.addParam(&lp.ln2b);
-            try self.adam.addParam(&lp.fc);
-            try self.adam.addParam(&lp.proj);
+            try self.adam.addParam(&lp.w1);
+            try self.adam.addParam(&lp.w3);
+            try self.adam.addParam(&lp.w2);
         }
     }
 
@@ -299,53 +275,59 @@ pub const Session = struct {
         const alloc = self.ctx.allocator();
         const tok_idx = try alloc.alloc(usize, BT);
         defer alloc.free(tok_idx);
-        const pos_idx = try alloc.alloc(usize, BT);
-        defer alloc.free(pos_idx);
+        const positions = try alloc.alloc(i32, BT);
+        defer alloc.free(positions);
         for (0..BT) |r| {
             std.debug.assert(tokens[r] < cfg.vocab_size);
             tok_idx[r] = tokens[r];
-            pos_idx[r] = r % T;
+            positions[r] = @intCast(r % T);
         }
 
         var x = try self.params.wte.gather(&self.ctx, .vocab, tok_idx, .seq);
-        const pe = try self.params.wpe.gather(&self.ctx, .pos, pos_idx, .seq);
-        x = try x.add(&self.ctx, &pe);
-
         for (0..cfg.n_layer) |l| {
-            x = try self.forwardBlock(l, &x, T);
+            x = try self.forwardBlock(l, &x, T, positions);
         }
 
-        const nf = try x.layerNorm(&self.ctx, .model, eps, .{
-            .weight = &self.params.lnfg,
-            .bias = &self.params.lnfb,
-        });
+        const nf = try x.rmsNormMul(&self.ctx, .model, &self.params.lnfg, eps);
         return nf.matmul(&self.ctx, &self.params.wte, .trans_b, .{ .seq, .vocab });
     }
 
-    fn forwardBlock(self: *Session, l: usize, x: *const Stream, T: usize) !Stream {
+    fn forwardBlock(self: *Session, l: usize, x: *const Stream, T: usize, positions: []const i32) !Stream {
+        const cfg = self.model.cfg;
+        const H: usize = cfg.n_head;
+        const Hkv: usize = cfg.n_kv_head;
+        const hd: usize = cfg.headDim();
         const lp = &self.params.layers[l];
         const ctx = &self.ctx;
 
-        const n1 = try x.layerNorm(ctx, .model, eps, .{ .weight = &lp.ln1g, .bias = &lp.ln1b });
+        const n1 = try x.rmsNormMul(ctx, .model, &lp.ln1g, eps);
         const q = try n1.matmul(ctx, &lp.wq, .plain, .{ .seq, .model });
         const k = try n1.matmul(ctx, &lp.wk, .plain, .{ .seq, .model });
         const v = try n1.matmul(ctx, &lp.wv, .plain, .{ .seq, .model });
 
-        const attn = try self.attention(&q, &k, &v, T);
+        const q3 = try q.split(ctx, .model, .{ .head, .d }, .{ H, hd });
+        const k3 = try k.split(ctx, .model, .{ .kv_head, .d }, .{ Hkv, hd });
+        const v3 = try v.split(ctx, .model, .{ .kv_head, .d }, .{ Hkv, hd });
+
+        const theta = fucina.RopeTheta{ .positions = positions, .theta_base = rope_theta };
+        const q_rot = try q3.rope(ctx, .seq, .d, theta, .half);
+        const k_rot = try k3.rope(ctx, .seq, .d, theta, .half);
+
+        const attn = try self.attention(&q_rot, &k_rot, &v3, T);
         const o = try attn.matmul(ctx, &lp.wo, .plain, .{ .seq, .model });
         const x1 = try x.add(ctx, &o);
 
-        const n2 = try x1.layerNorm(ctx, .model, eps, .{ .weight = &lp.ln2g, .bias = &lp.ln2b });
-        const h = try n2.matmul(ctx, &lp.fc, .plain, .{ .seq, .hidden });
-        const hg = try h.gelu(ctx);
-        const p = try hg.matmul(ctx, &lp.proj, .plain, .{ .seq, .model });
+        const n2 = try x1.rmsNormMul(ctx, .model, &lp.ln2g, eps);
+        const gate = try n2.matmul(ctx, &lp.w1, .plain, .{ .seq, .hidden });
+        const up = try n2.matmul(ctx, &lp.w3, .plain, .{ .seq, .hidden });
+        const act = try up.swiglu(ctx, &gate);
+        const p = try act.matmul(ctx, &lp.w2, .plain, .{ .seq, .model });
         return x1.add(ctx, &p);
     }
 
-    /// Causal attention for every batch row, then re-concatenated along seq.
-    fn attention(self: *Session, q: *const Stream, k: *const Stream, v: *const Stream, T: usize) !AttnStream {
+    /// Causal GQA for every batch row, then re-concatenated along seq.
+    fn attention(self: *Session, q: *const HeadStream, k: *const KvStream, v: *const KvStream, T: usize) !AttnStream {
         const cfg = self.model.cfg;
-        const H: usize = cfg.n_head;
         const hd: usize = cfg.headDim();
         const B = self.batch;
         const alloc = self.ctx.allocator();
@@ -357,10 +339,7 @@ pub const Session = struct {
             const qb = try q.narrow(&self.ctx, .seq, b * T, T);
             const kb = try k.narrow(&self.ctx, .seq, b * T, T);
             const vb = try v.narrow(&self.ctx, .seq, b * T, T);
-            const q3 = try qb.split(&self.ctx, .model, .{ .head, .d }, .{ H, hd });
-            const k3 = try kb.split(&self.ctx, .model, .{ .kv_head, .d }, .{ H, hd });
-            const v3 = try vb.split(&self.ctx, .model, .{ .kv_head, .d }, .{ H, hd });
-            parts[b] = try q3.groupedAttention(&self.ctx, &k3, &v3, self.head_map, .attn, scale, .{});
+            parts[b] = try qb.groupedAttention(&self.ctx, &kb, &vb, self.head_map, .attn, scale, .{});
         }
         if (B == 1) return parts[0];
 
@@ -382,8 +361,7 @@ pub const Session = struct {
         return loss.item();
     }
 
-    /// Copy of the `[batch*seq, vocab]` logits (used by the cached-decoding
-    /// parity test and other diagnostics).
+    /// Copy of the `[batch*seq, vocab]` logits (used by diagnostics/tests).
     pub fn logitsAlloc(self: *Session, allocator: std.mem.Allocator, tokens: []const u32, T: usize) ![]f32 {
         const scope = self.ctx.openExecScope();
         defer self.ctx.closeExecScope(scope);
@@ -398,8 +376,7 @@ pub const Session = struct {
         return out;
     }
 
-    /// Run `tokens` through the model and fill the KV cache with their keys and
-    /// values, so the next `forwardStep` only has to look at one new token.
+    /// Run `tokens` through the model and fill the KV cache.
     pub fn forwardPrefill(self: *Session, cache: *KvCache, tokens: []const u32, T: usize) !void {
         std.debug.assert(T <= cache.max_seq);
         for (tokens[0..T], 0..) |tok, i| {
@@ -407,14 +384,14 @@ pub const Session = struct {
         }
     }
 
-    /// Decode a single new token at position `pos` (== cache.pos), reading keys
-    /// and values out of `cache`. Writes the next-token logits into
-    /// `self.logits[0..vocab]`.
+    /// Decode a single new token at position `pos`, reading K/V from `cache`.
     pub fn forwardStep(self: *Session, cache: *KvCache, token: u32, pos: usize) !void {
         const cfg = self.model.cfg;
         const C: usize = cfg.n_embd;
         const H: usize = cfg.n_head;
+        const Hkv: usize = cfg.n_kv_head;
         const hd: usize = cfg.headDim();
+        const kv_dim: usize = cfg.kvDim();
         std.debug.assert(pos < cache.max_seq);
         std.debug.assert(token < cfg.vocab_size);
 
@@ -427,54 +404,58 @@ pub const Session = struct {
         const p = &self.params;
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
         const tok_idx = [_]usize{token};
-        const pos_idx = [_]usize{pos};
+        const pos_arr = [_]i32{@intCast(pos)};
+        const theta = fucina.RopeTheta{ .positions = &pos_arr, .theta_base = rope_theta };
 
         var x = try p.wte.gather(ctx, .vocab, &tok_idx, .seq);
-        const pe = try p.wpe.gather(ctx, .pos, &pos_idx, .seq);
-        x = try x.add(ctx, &pe);
 
         for (0..cfg.n_layer) |l| {
             const lp = &p.layers[l];
-            const n1 = try x.layerNorm(ctx, .model, eps, .{ .weight = &lp.ln1g, .bias = &lp.ln1b });
+            const n1 = try x.rmsNormMul(ctx, .model, &lp.ln1g, eps);
             const q = try n1.matmul(ctx, &lp.wq, .plain, .{ .seq, .model });
             const k = try n1.matmul(ctx, &lp.wk, .plain, .{ .seq, .model });
             const v = try n1.matmul(ctx, &lp.wv, .plain, .{ .seq, .model });
 
             const q3 = try q.split(ctx, .model, .{ .head, .d }, .{ H, hd });
-            const k3 = try k.split(ctx, .model, .{ .kv_head, .d }, .{ H, hd });
-            const v3 = try v.split(ctx, .model, .{ .kv_head, .d }, .{ H, hd });
-            @memcpy(cache.k[l][pos * C ..][0..C], try k3.dataConst());
-            @memcpy(cache.v[l][pos * C ..][0..C], try v3.dataConst());
+            const k3 = try k.split(ctx, .model, .{ .kv_head, .d }, .{ Hkv, hd });
+            const v3 = try v.split(ctx, .model, .{ .kv_head, .d }, .{ Hkv, hd });
+            const q_rot = try q3.rope(ctx, .seq, .d, theta, .half);
+            const k_rot = try k3.rope(ctx, .seq, .d, theta, .half);
+
+            @memcpy(cache.k[l][pos * kv_dim ..][0..kv_dim], try k_rot.dataConst());
+            @memcpy(cache.v[l][pos * kv_dim ..][0..kv_dim], try v3.dataConst());
 
             var kview = try fucina.Tensor(.{ .seq, .kv_head, .d }).fromBorrowedConstSlice(
                 ctx,
-                .{ pos + 1, H, hd },
-                cache.k[l][0 .. (pos + 1) * C],
+                .{ pos + 1, Hkv, hd },
+                cache.k[l][0 .. (pos + 1) * kv_dim],
             );
             defer kview.deinit();
             var vview = try fucina.Tensor(.{ .seq, .kv_head, .d }).fromBorrowedConstSlice(
                 ctx,
-                .{ pos + 1, H, hd },
-                cache.v[l][0 .. (pos + 1) * C],
+                .{ pos + 1, Hkv, hd },
+                cache.v[l][0 .. (pos + 1) * kv_dim],
             );
             defer vview.deinit();
 
-            const attn = try q3.groupedAttention(ctx, &kview, &vview, self.head_map, .attn, scale, .{});
+            const attn = try q_rot.groupedAttention(ctx, &kview, &vview, self.head_map, .attn, scale, .{});
             const o = try attn.matmul(ctx, &lp.wo, .plain, .{ .seq, .model });
             const x1 = try x.add(ctx, &o);
 
-            const n2 = try x1.layerNorm(ctx, .model, eps, .{ .weight = &lp.ln2g, .bias = &lp.ln2b });
-            const h = try n2.matmul(ctx, &lp.fc, .plain, .{ .seq, .hidden });
-            const hg = try h.gelu(ctx);
-            const pr = try hg.matmul(ctx, &lp.proj, .plain, .{ .seq, .model });
+            const n2 = try x1.rmsNormMul(ctx, .model, &lp.ln2g, eps);
+            const gate = try n2.matmul(ctx, &lp.w1, .plain, .{ .seq, .hidden });
+            const up = try n2.matmul(ctx, &lp.w3, .plain, .{ .seq, .hidden });
+            const act = try up.swiglu(ctx, &gate);
+            const pr = try act.matmul(ctx, &lp.w2, .plain, .{ .seq, .model });
             x = try x1.add(ctx, &pr);
         }
 
-        const nf = try x.layerNorm(ctx, .model, eps, .{ .weight = &p.lnfg, .bias = &p.lnfb });
+        const nf = try x.rmsNormMul(ctx, .model, &p.lnfg, eps);
         const logits = try nf.matmul(ctx, &p.wte, .trans_b, .{ .seq, .vocab });
         @memcpy(self.logits, try logits.dataConst());
 
         cache.pos = pos + 1;
+        _ = C;
     }
 
     // -- backward -----------------------------------------------------------
@@ -483,8 +464,7 @@ pub const Session = struct {
         self.adam.zeroGrad();
     }
 
-    /// Forward + backward. Gradients accumulate into the parameter leaves, so
-    /// call `zeroGrads` first for a clean step.
+    /// Forward + backward. Gradients accumulate into the parameter leaves.
     pub fn fwdBwd(self: *Session, tokens: []const u32, targets: []const u32, T: usize) !f32 {
         const scope = self.ctx.openExecScope();
         defer self.ctx.closeExecScope(scope);
@@ -518,12 +498,6 @@ pub const Session = struct {
 
     // -- sampling -----------------------------------------------------------
 
-    /// Autoregressive generation with a KV cache.
-    ///
-    /// The prompt is prefilled one token at a time (each step fills one cache
-    /// row), then each new token costs a single-row forward over the cached
-    /// keys/values. When the context fills up the newest half is kept and
-    /// replayed.
     pub fn generate(
         self: *Session,
         allocator: std.mem.Allocator,
@@ -549,7 +523,6 @@ pub const Session = struct {
         const order = try allocator.alloc(u32, V);
         defer allocator.free(order);
 
-        // prefill the tail of the prompt
         const pre_len = @min(prompt.len, block);
         @memcpy(ctx_buf[0..pre_len], prompt[prompt.len - pre_len ..]);
         var ctx_len: usize = pre_len;
@@ -558,7 +531,6 @@ pub const Session = struct {
 
         for (0..max_new_tokens) |_| {
             if (cache.pos >= block) {
-                // context full: keep the newest half, re-prefill, positions restart
                 const keep = @max(block / 2, 1);
                 std.mem.copyForwards(u32, ctx_buf[0..keep], ctx_buf[ctx_len - keep .. ctx_len]);
                 ctx_len = keep;
@@ -643,6 +615,7 @@ const testing = std.testing;
 pub const tiny_test_cfg = model_mod.Config{
     .n_layer = 2,
     .n_head = 2,
+    .n_kv_head = 1,
     .n_embd = 16,
     .block_size = 8,
     .vocab_size = 8,
@@ -672,7 +645,7 @@ test "gradients match finite differences" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_embd = 8, .block_size = 4, .vocab_size = 6 };
+    const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_kv_head = 1, .n_embd = 8, .block_size = 4, .vocab_size = 6 };
     var m = try Model.initRandomChar(allocator, cfg, "abcdef", 99);
     defer m.deinit();
     const s = try Session.init(allocator, &m, 2);
@@ -693,34 +666,34 @@ test "gradients match finite differences" {
         probes[0] = .{ .idx = m.layout.wte + 1, .grad = (try g.dataConst())[1] };
     }
     {
-        var g = (try s.params.wpe.grad(&s.ctx)).?;
-        defer g.deinit();
-        probes[1] = .{ .idx = m.layout.wpe + 1, .grad = (try g.dataConst())[1] };
-    }
-    {
         var g = (try s.params.layers[0].wq.grad(&s.ctx)).?;
         defer g.deinit();
-        probes[2] = .{ .idx = m.layout.layers[0].wq + 3, .grad = (try g.dataConst())[3] };
+        probes[1] = .{ .idx = m.layout.layers[0].wq + 3, .grad = (try g.dataConst())[3] };
     }
     {
-        var g = (try s.params.layers[0].fc.grad(&s.ctx)).?;
+        var g = (try s.params.layers[0].w1.grad(&s.ctx)).?;
         defer g.deinit();
-        probes[3] = .{ .idx = m.layout.layers[0].fc + 5, .grad = (try g.dataConst())[5] };
+        probes[2] = .{ .idx = m.layout.layers[0].w1 + 5, .grad = (try g.dataConst())[5] };
     }
     {
-        var g = (try s.params.layers[0].proj.grad(&s.ctx)).?;
+        var g = (try s.params.layers[0].w2.grad(&s.ctx)).?;
         defer g.deinit();
-        probes[4] = .{ .idx = m.layout.layers[0].proj + 7, .grad = (try g.dataConst())[7] };
+        probes[3] = .{ .idx = m.layout.layers[0].w2 + 7, .grad = (try g.dataConst())[7] };
     }
     {
         var g = (try s.params.lnfg.grad(&s.ctx)).?;
         defer g.deinit();
-        probes[5] = .{ .idx = m.layout.lnfg, .grad = (try g.dataConst())[0] };
+        probes[4] = .{ .idx = m.layout.lnfg, .grad = (try g.dataConst())[0] };
     }
     {
         var g = (try s.params.layers[0].ln1g.grad(&s.ctx)).?;
         defer g.deinit();
-        probes[6] = .{ .idx = m.layout.layers[0].ln1g + 1, .grad = (try g.dataConst())[1] };
+        probes[5] = .{ .idx = m.layout.layers[0].ln1g + 1, .grad = (try g.dataConst())[1] };
+    }
+    {
+        var g = (try s.params.layers[0].wo.grad(&s.ctx)).?;
+        defer g.deinit();
+        probes[6] = .{ .idx = m.layout.layers[0].wo + 2, .grad = (try g.dataConst())[2] };
     }
 
     const h: f32 = 1e-2;
@@ -746,7 +719,7 @@ test "repeated backward passes are identical (scratch is not carried over)" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const cfg = model_mod.Config{ .n_layer = 2, .n_head = 2, .n_embd = 16, .block_size = 4, .vocab_size = 8 };
+    const cfg = model_mod.Config{ .n_layer = 2, .n_head = 2, .n_kv_head = 1, .n_embd = 16, .block_size = 4, .vocab_size = 8 };
     var m = try Model.initRandomChar(allocator, cfg, "abcdefgh", 77);
     defer m.deinit();
     const s = try Session.init(allocator, &m, 2);
@@ -774,7 +747,7 @@ test "one optimisation step reduces the loss" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_embd = 16, .block_size = 8, .vocab_size = 6 };
+    const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_kv_head = 1, .n_embd = 16, .block_size = 8, .vocab_size = 6 };
     var m = try Model.initRandomChar(allocator, cfg, "abcdef", 5);
     defer m.deinit();
     const s = try Session.init(allocator, &m, 2);
@@ -800,7 +773,7 @@ test "cached decoding matches a full forward pass (greedy)" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const cfg = model_mod.Config{ .n_layer = 2, .n_head = 2, .n_embd = 16, .block_size = 16, .vocab_size = 8 };
+    const cfg = model_mod.Config{ .n_layer = 2, .n_head = 2, .n_kv_head = 1, .n_embd = 16, .block_size = 16, .vocab_size = 8 };
     var m = try Model.initRandomChar(allocator, cfg, "abcdefgh", 21);
     defer m.deinit();
     const s = try Session.init(allocator, &m, 1);
@@ -809,13 +782,11 @@ test "cached decoding matches a full forward pass (greedy)" {
     const prompt = [_]u32{ 1, 2, 3, 4, 5 };
     const n_new = 10;
 
-    // cached path (what the CLI and server use)
     var cached: std.ArrayList(u32) = .empty;
     defer cached.deinit(allocator);
     try s.generate(allocator, &prompt, n_new, .{ .temperature = 0.0, .top_k = 0, .seed = 1 }, null, &cached);
     try testing.expectEqual(@as(usize, n_new), cached.items.len);
 
-    // reference path: re-run the whole context for every token
     var ctx: std.ArrayList(u32) = .empty;
     defer ctx.deinit(allocator);
     try ctx.appendSlice(allocator, &prompt);
@@ -841,11 +812,9 @@ test "a training-batch session can still sample" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_embd = 8, .block_size = 8, .vocab_size = 6 };
+    const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_kv_head = 1, .n_embd = 8, .block_size = 8, .vocab_size = 6 };
     var m = try Model.initRandomChar(allocator, cfg, "abcdef", 13);
     defer m.deinit();
-    // Decode always uses the single-row path, even on a session sized for
-    // training batches (the CLI samples during training this way).
     const s = try Session.init(allocator, &m, 4);
     defer s.deinit();
 
@@ -861,7 +830,7 @@ test "generate streams the requested number of tokens" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_embd = 8, .block_size = 8, .vocab_size = 6 };
+    const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_kv_head = 1, .n_embd = 8, .block_size = 8, .vocab_size = 6 };
     var m = try Model.initRandomChar(allocator, cfg, "abcdef", 11);
     defer m.deinit();
     const s = try Session.init(allocator, &m, 1);

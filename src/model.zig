@@ -10,14 +10,16 @@
 //! `.vzm` layout (little-endian):
 //!
 //!   magic       4 bytes  "VZLM"
-//!   version     u32      1 = char vocab, 2 = corpus-trained BPE blob
+//!   version     u32      3 (modern dense block)
+//!   tokenizer_kind u32   1 = char vocab, 2 = corpus-trained BPE blob
 //!   n_layer     u32
 //!   n_head      u32
+//!   n_kv_head   u32      GQA KV heads
 //!   n_embd      u32
 //!   block_size  u32
 //!   vocab_size  u32
 //!   vocab_len   u32      number of tokenizer bytes following
-//!   vocab       [vocab_len]u8   (# v1: byte->id table, # v2: BPE blob)
+//!   vocab       [vocab_len]u8
 //!   n_tensors   u32
 //!   repeated n_tensors times:
 //!       name_len u32, name [name_len]u8, rows u32, cols u32, dtype u32(0 = f32)
@@ -26,10 +28,12 @@ const std = @import("std");
 const tokenizer_mod = @import("tokenizer.zig");
 
 pub const magic = "VZLM";
+pub const version: u32 = 3;
 
 pub const Config = struct {
     n_layer: u32 = 3,
     n_head: u32 = 4,
+    n_kv_head: u32 = 2,
     n_embd: u32 = 96,
     block_size: u32 = 64,
     vocab_size: u32 = 65,
@@ -38,14 +42,23 @@ pub const Config = struct {
         return self.n_embd / self.n_head;
     }
 
+    pub fn kvDim(self: Config) usize {
+        return self.n_kv_head * self.headDim();
+    }
+
+    /// SwiGLU uses three matrices; `8/3 * d` keeps the FFN parameter count
+    /// equal to the old 4x GELU MLP's two matrices.
     pub fn mlpDim(self: Config) usize {
-        return self.n_embd * 4;
+        return (8 * self.n_embd) / 3;
     }
 
     pub fn validate(self: Config) !void {
         if (self.n_layer == 0) return error.InvalidConfig;
         if (self.n_head == 0) return error.InvalidConfig;
+        if (self.n_kv_head == 0 or self.n_kv_head > self.n_head) return error.InvalidConfig;
+        if (self.n_head % self.n_kv_head != 0) return error.InvalidConfig;
         if (self.n_embd == 0 or self.n_embd % self.n_head != 0) return error.InvalidConfig;
+        if (self.headDim() % 2 != 0) return error.InvalidConfig; // RoPE pairs
         if (self.block_size == 0) return error.InvalidConfig;
         if (self.vocab_size < 2) return error.InvalidConfig;
     }
@@ -66,22 +79,19 @@ pub const TensorInfo = struct {
 /// never does string lookups.
 pub const LayerOffsets = struct {
     ln1g: usize,
-    ln1b: usize,
     wq: usize,
     wk: usize,
     wv: usize,
     wo: usize,
     ln2g: usize,
-    ln2b: usize,
-    fc: usize,
-    proj: usize,
+    w1: usize,
+    w3: usize,
+    w2: usize,
 };
 
 pub const Layout = struct {
     wte: usize,
-    wpe: usize,
     lnfg: usize,
-    lnfb: usize,
     layers: []LayerOffsets,
 };
 
@@ -148,33 +158,27 @@ pub const Model = struct {
         return Model.initRandom(allocator, cfg, tk, vocab, seed);
     }
 
-    /// Scaled normal init, GPT-2 style: residual projections get a smaller std
+    /// Scaled normal init: residual projections get a smaller std
     /// (0.02 / sqrt(2 * n_layer)) so activations do not blow up with depth.
     fn initWeights(self: *Model, seed: u64) void {
         var prng = std.Random.DefaultPrng.init(seed);
         const r = prng.random();
         const cfg = self.cfg;
-        const c: usize = cfg.n_embd;
         const residual_std = 0.02 / @sqrt(2.0 * @as(f32, @floatFromInt(cfg.n_layer)));
 
         normalSlice(r, self.view(self.layout.wte), 0, 0.02);
-        normalSlice(r, self.view(self.layout.wpe), 0, 0.01);
-        for (self.layout.layers, 0..) |lo, i| {
-            _ = i;
+        for (self.layout.layers) |lo| {
             fillSlice(self.view(lo.ln1g), 1.0);
-            fillSlice(self.view(lo.ln1b), 0.0);
             normalSlice(r, self.view(lo.wq), 0, 0.02);
             normalSlice(r, self.view(lo.wk), 0, 0.02);
             normalSlice(r, self.view(lo.wv), 0, 0.02);
             normalSlice(r, self.view(lo.wo), 0, residual_std);
             fillSlice(self.view(lo.ln2g), 1.0);
-            fillSlice(self.view(lo.ln2b), 0.0);
-            normalSlice(r, self.view(lo.fc), 0, 0.02);
-            normalSlice(r, self.view(lo.proj), 0, residual_std);
-            _ = c;
+            normalSlice(r, self.view(lo.w1), 0, 0.02);
+            normalSlice(r, self.view(lo.w3), 0, 0.02);
+            normalSlice(r, self.view(lo.w2), 0, residual_std);
         }
         fillSlice(self.view(self.layout.lnfg), 1.0);
-        fillSlice(self.view(self.layout.lnfb), 0.0);
     }
 
     pub fn view(self: *const Model, offset: usize) []f32 {
@@ -208,9 +212,11 @@ pub const Model = struct {
         errdefer out.deinit(allocator);
 
         try out.appendSlice(allocator, magic);
+        try appendU32(&out, allocator, version);
         try appendU32(&out, allocator, self.tokenizer.version());
         try appendU32(&out, allocator, self.cfg.n_layer);
         try appendU32(&out, allocator, self.cfg.n_head);
+        try appendU32(&out, allocator, self.cfg.n_kv_head);
         try appendU32(&out, allocator, self.cfg.n_embd);
         try appendU32(&out, allocator, self.cfg.block_size);
         try appendU32(&out, allocator, self.cfg.vocab_size);
@@ -252,11 +258,13 @@ pub const Model = struct {
         const got_magic = try rd.take(4);
         if (!std.mem.eql(u8, got_magic, magic)) return error.BadMagic;
         const ver = try rd.u32le();
-        if (ver != 1 and ver != 2) return error.UnsupportedVersion;
+        if (ver != version) return error.UnsupportedVersion;
 
+        const tokenizer_kind = try rd.u32le();
         var cfg = Config{
             .n_layer = try rd.u32le(),
             .n_head = try rd.u32le(),
+            .n_kv_head = try rd.u32le(),
             .n_embd = try rd.u32le(),
             .block_size = try rd.u32le(),
             .vocab_size = try rd.u32le(),
@@ -265,7 +273,7 @@ pub const Model = struct {
 
         const vocab_len = try rd.u32le();
         const vocab = try rd.take(vocab_len);
-        var tokenizer = try tokenizer_mod.Tokenizer.fromSerialized(allocator, ver, vocab);
+        var tokenizer = try tokenizer_mod.Tokenizer.fromSerialized(allocator, tokenizer_kind, vocab);
         errdefer tokenizer.deinit();
         if (tokenizer.vocabSize() != cfg.vocab_size) return error.VocabSizeMismatch;
 
@@ -358,10 +366,10 @@ pub fn buildRegistry(allocator: std.mem.Allocator, cfg: Config) ![]TensorInfo {
     const c: usize = cfg.n_embd;
     const m: usize = cfg.mlpDim();
     const v: usize = cfg.vocab_size;
-    const t: usize = cfg.block_size;
-    // 2 global + per layer: 4 ln vectors (2*g,2*b as [c,1]) + 4 attn mats + 2 mlp mats
-    const per_layer = 10;
-    const n = 2 + @as(usize, cfg.n_layer) * per_layer + 2;
+    const kv: usize = cfg.kvDim();
+    // wte + per layer (2 norms + 4 attn + 3 SwiGLU) + final norm
+    const per_layer = 9;
+    const n = 2 + @as(usize, cfg.n_layer) * per_layer;
     const tensors = try allocator.alloc(TensorInfo, n);
     var idx: usize = 0;
     var offset: usize = 0;
@@ -369,25 +377,21 @@ pub fn buildRegistry(allocator: std.mem.Allocator, cfg: Config) ![]TensorInfo {
     tensors[idx] = .{ .name = try allocator.dupe(u8, "wte"), .offset = 0, .rows = v, .cols = c };
     offset += v * c;
     idx += 1;
-    tensors[idx] = .{ .name = try allocator.dupe(u8, "wpe"), .offset = offset, .rows = t, .cols = c };
-    offset += t * c;
-    idx += 1;
 
     for (0..cfg.n_layer) |l| {
         const dims = [_][2]usize{
             .{ c, 1 }, // ln1.g
-            .{ c, 1 }, // ln1.b
             .{ c, c }, // wq
-            .{ c, c }, // wk
-            .{ c, c }, // wv
+            .{ c, kv }, // wk
+            .{ c, kv }, // wv
             .{ c, c }, // wo
             .{ c, 1 }, // ln2.g
-            .{ c, 1 }, // ln2.b
-            .{ c, m }, // fc
-            .{ m, c }, // proj
+            .{ c, m }, // w1 (gate)
+            .{ c, m }, // w3 (up)
+            .{ m, c }, // w2 (down)
         };
         const suffixes = [_][]const u8{
-            "ln1.g", "ln1.b", "attn.wq", "attn.wk", "attn.wv", "attn.wo", "ln2.g", "ln2.b", "mlp.fc", "mlp.proj",
+            "ln1.g", "attn.wq", "attn.wk", "attn.wv", "attn.wo", "ln2.g", "mlp.w1", "mlp.w3", "mlp.w2",
         };
         for (dims, suffixes) |d, suffix| {
             const name = try std.fmt.allocPrint(allocator, "h{d}.{s}", .{ l, suffix });
@@ -398,9 +402,6 @@ pub fn buildRegistry(allocator: std.mem.Allocator, cfg: Config) ![]TensorInfo {
     }
 
     tensors[idx] = .{ .name = try allocator.dupe(u8, "lnf.g"), .offset = offset, .rows = c, .cols = 1 };
-    offset += c;
-    idx += 1;
-    tensors[idx] = .{ .name = try allocator.dupe(u8, "lnf.b"), .offset = offset, .rows = c, .cols = 1 };
     idx += 1;
 
     return tensors;
@@ -410,33 +411,24 @@ fn resolveLayout(allocator: std.mem.Allocator, cfg: Config, tensors: []const Ten
     const layers = try allocator.alloc(LayerOffsets, cfg.n_layer);
     errdefer allocator.free(layers);
 
-    var layout = Layout{
-        .wte = 0,
-        .wpe = 0,
-        .lnfg = 0,
-        .lnfb = 0,
-        .layers = layers,
-    };
+    var layout = Layout{ .wte = 0, .lnfg = 0, .layers = layers };
 
     for (tensors) |t| {
         if (std.mem.eql(u8, t.name, "wte")) layout.wte = t.offset;
-        if (std.mem.eql(u8, t.name, "wpe")) layout.wpe = t.offset;
         if (std.mem.eql(u8, t.name, "lnf.g")) layout.lnfg = t.offset;
-        if (std.mem.eql(u8, t.name, "lnf.b")) layout.lnfb = t.offset;
     }
 
     for (layers, 0..) |*lo, l| {
         lo.* = .{
             .ln1g = try need(tensors, l, "ln1.g"),
-            .ln1b = try need(tensors, l, "ln1.b"),
             .wq = try need(tensors, l, "attn.wq"),
             .wk = try need(tensors, l, "attn.wk"),
             .wv = try need(tensors, l, "attn.wv"),
             .wo = try need(tensors, l, "attn.wo"),
             .ln2g = try need(tensors, l, "ln2.g"),
-            .ln2b = try need(tensors, l, "ln2.b"),
-            .fc = try need(tensors, l, "mlp.fc"),
-            .proj = try need(tensors, l, "mlp.proj"),
+            .w1 = try need(tensors, l, "mlp.w1"),
+            .w3 = try need(tensors, l, "mlp.w3"),
+            .w2 = try need(tensors, l, "mlp.w2"),
         };
     }
     return layout;
@@ -458,7 +450,7 @@ fn need(tensors: []const TensorInfo, layer: usize, suffix: []const u8) !usize {
 const testing = std.testing;
 
 test "registry offsets are contiguous and cover the blob" {
-    const cfg = Config{ .n_layer = 2, .n_head = 2, .n_embd = 16, .block_size = 8, .vocab_size = 32 };
+    const cfg = Config{ .n_layer = 2, .n_head = 2, .n_kv_head = 1, .n_embd = 16, .block_size = 8, .vocab_size = 32 };
     const tensors = try buildRegistry(testing.allocator, cfg);
     defer freeRegistry(testing.allocator, tensors);
 
@@ -467,12 +459,14 @@ test "registry offsets are contiguous and cover the blob" {
         try testing.expectEqual(expected_offset, t.offset);
         expected_offset += t.len();
     }
-    try testing.expectEqual(@as(usize, 2 + 2 * 10 + 2), tensors.len);
+    try testing.expectEqual(@as(usize, 2 + 2 * 9), tensors.len);
 
-    // wte + wpe + layers*(4*C*C + 2*C*4C + 4*C) + 2*C
+    // wte + layers*(2 norms + wq/wo + wk/wv + w1/w3/w2) + lnf
     const c: usize = 16;
-    const want = cfg.vocab_size * c + cfg.block_size * c +
-        cfg.n_layer * (4 * c * c + 2 * c * 4 * c + 4 * c) + 2 * c;
+    const kv = cfg.kvDim();
+    const m = cfg.mlpDim();
+    const want = cfg.vocab_size * c +
+        cfg.n_layer * (2 * c + 2 * c * c + 2 * c * kv + 3 * c * m) + c;
     try testing.expectEqual(want, expected_offset);
 }
 
@@ -481,7 +475,7 @@ test "checkpoint round-trip preserves config, vocab and weights" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const cfg = Config{ .n_layer = 2, .n_head = 2, .n_embd = 16, .block_size = 8, .vocab_size = 10 };
+    const cfg = Config{ .n_layer = 2, .n_head = 2, .n_kv_head = 1, .n_embd = 16, .block_size = 8, .vocab_size = 10 };
     const vocab = "abcdefghij";
     var m = try Model.initRandomChar(allocator, cfg, vocab, 1234);
     defer m.deinit();
@@ -494,13 +488,14 @@ test "checkpoint round-trip preserves config, vocab and weights" {
 
     try testing.expectEqual(cfg.n_layer, loaded.cfg.n_layer);
     try testing.expectEqual(cfg.n_embd, loaded.cfg.n_embd);
+    try testing.expectEqual(cfg.n_kv_head, loaded.cfg.n_kv_head);
     try testing.expectEqualStrings(vocab, loaded.vocab);
     try testing.expectEqual(tokenizer_mod.Tokenizer.Kind.char, loaded.tokenizer.kind());
     try testing.expectEqualSlices(f32, m.blob, loaded.blob);
-    try testing.expectEqual(m.layout.layers[1].proj, loaded.layout.layers[1].proj);
+    try testing.expectEqual(m.layout.layers[1].w2, loaded.layout.layers[1].w2);
 }
 
-test "BPE checkpoint round-trip (format v2)" {
+test "BPE checkpoint round-trip (format v3)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -510,13 +505,14 @@ test "BPE checkpoint round-trip (format v2)" {
     defer allocator.free(blob);
 
     const tk = try tokenizer_mod.Tokenizer.initBpeFromBlob(allocator, blob);
-    const cfg = Config{ .n_layer = 1, .n_head = 1, .n_embd = 8, .block_size = 4, .vocab_size = @intCast(tk.vocabSize()) };
+    const cfg = Config{ .n_layer = 1, .n_head = 1, .n_kv_head = 1, .n_embd = 8, .block_size = 4, .vocab_size = @intCast(tk.vocabSize()) };
     var m = try Model.initRandom(allocator, cfg, tk, blob, 9);
     defer m.deinit();
 
     const bytes = try m.serialize(allocator);
     defer allocator.free(bytes);
-    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[4..8], .little));
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, bytes[4..8], .little));
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[8..12], .little)); // BPE
 
     var loaded = try Model.deserialize(allocator, bytes);
     defer loaded.deinit();
@@ -529,7 +525,7 @@ test "deserialize rejects a corrupted magic" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const cfg = Config{ .n_layer = 1, .n_head = 1, .n_embd = 8, .block_size = 4, .vocab_size = 4 };
+    const cfg = Config{ .n_layer = 1, .n_head = 1, .n_kv_head = 1, .n_embd = 8, .block_size = 4, .vocab_size = 4 };
     var m = try Model.initRandomChar(allocator, cfg, "abcd", 7);
     defer m.deinit();
     const bytes = try m.serialize(allocator);
