@@ -653,7 +653,7 @@ test "forward produces finite logits of the right shape" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var m = try Model.initRandom(allocator, tiny_test_cfg, "abcdefgh", 3);
+    var m = try Model.initRandomChar(allocator, tiny_test_cfg, "abcdefgh", 3);
     defer m.deinit();
     const s = try Session.init(allocator, &m, 2);
     defer s.deinit();
@@ -673,7 +673,7 @@ test "gradients match finite differences" {
     const allocator = gpa.allocator();
 
     const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_embd = 8, .block_size = 4, .vocab_size = 6 };
-    var m = try Model.initRandom(allocator, cfg, "abcdef", 99);
+    var m = try Model.initRandomChar(allocator, cfg, "abcdef", 99);
     defer m.deinit();
     const s = try Session.init(allocator, &m, 2);
     defer s.deinit();
@@ -747,7 +747,7 @@ test "repeated backward passes are identical (scratch is not carried over)" {
     const allocator = gpa.allocator();
 
     const cfg = model_mod.Config{ .n_layer = 2, .n_head = 2, .n_embd = 16, .block_size = 4, .vocab_size = 8 };
-    var m = try Model.initRandom(allocator, cfg, "abcdefgh", 77);
+    var m = try Model.initRandomChar(allocator, cfg, "abcdefgh", 77);
     defer m.deinit();
     const s = try Session.init(allocator, &m, 2);
     defer s.deinit();
@@ -775,7 +775,7 @@ test "one optimisation step reduces the loss" {
     const allocator = gpa.allocator();
 
     const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_embd = 16, .block_size = 8, .vocab_size = 6 };
-    var m = try Model.initRandom(allocator, cfg, "abcdef", 5);
+    var m = try Model.initRandomChar(allocator, cfg, "abcdef", 5);
     defer m.deinit();
     const s = try Session.init(allocator, &m, 2);
     defer s.deinit();
@@ -801,7 +801,7 @@ test "cached decoding matches a full forward pass (greedy)" {
     const allocator = gpa.allocator();
 
     const cfg = model_mod.Config{ .n_layer = 2, .n_head = 2, .n_embd = 16, .block_size = 16, .vocab_size = 8 };
-    var m = try Model.initRandom(allocator, cfg, "abcdefgh", 21);
+    var m = try Model.initRandomChar(allocator, cfg, "abcdefgh", 21);
     defer m.deinit();
     const s = try Session.init(allocator, &m, 1);
     defer s.deinit();
@@ -842,7 +842,7 @@ test "a training-batch session can still sample" {
     const allocator = gpa.allocator();
 
     const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_embd = 8, .block_size = 8, .vocab_size = 6 };
-    var m = try Model.initRandom(allocator, cfg, "abcdef", 13);
+    var m = try Model.initRandomChar(allocator, cfg, "abcdef", 13);
     defer m.deinit();
     // Decode always uses the single-row path, even on a session sized for
     // training batches (the CLI samples during training this way).
@@ -862,7 +862,7 @@ test "generate streams the requested number of tokens" {
     const allocator = gpa.allocator();
 
     const cfg = model_mod.Config{ .n_layer = 1, .n_head = 2, .n_embd = 8, .block_size = 8, .vocab_size = 6 };
-    var m = try Model.initRandom(allocator, cfg, "abcdef", 11);
+    var m = try Model.initRandomChar(allocator, cfg, "abcdef", 11);
     defer m.deinit();
     const s = try Session.init(allocator, &m, 1);
     defer s.deinit();

@@ -9,28 +9,14 @@ Python. No GPU. The model is trained and served by the same Zig code that
 defines it.
 
 ```
-$ llm train --steps 12000        # learn Shakespeare from characters up
+$ llm train --steps 12000        # learn Shakespeare from BPE tokens up
 $ llm infer --prompt "ROMEO:"    # sample text, streaming
 $ llm serve                      # http://localhost:8080 — chat UI + JSON API
 ```
 
-Real output from a 12,000-step checkpoint (`--temp 0.8 --top-k 40`):
-
-```
-ROMEO:
-Ah, all the come of your son,
-As are is my such comes repent.
-
-ESCALUS:
-Hill I father, they dareless the crown:
-I am do tell me such for the gold friend:
-'Tis't I'll say to her hath dead wash of this advise,
-So to Julie
-```
-
-It is a 345k-parameter model trained for 12,000 steps on a 1 MB corpus — it
-learned the *shape* of Shakespeare (names, line breaks, verse rhythm, real words),
-not the meaning of it.
+The tokenizer is a **byte-level BPE trained on the corpus itself** (`--vocab`,
+default 1,024 tokens), not a downloaded vocabulary. The model is 437k parameters
+and the tokenizer blob travels inside the `.vzm` checkpoint.
 
 ---
 
@@ -40,7 +26,7 @@ not the meaning of it.
 | --- | --- | --- |
 | tensor math | `fucina` 0.5.1 | tagged f32 tensors, CPU SIMD kernels, eager autograd, AdamW |
 | checkpoint format | `src/model.zig` | config + tensor registry + weights in one flat blob (`.vzm`) |
-| tokenizer | `src/tokenizer.zig` | byte-level char tokenizer, vocab travels with the model |
+| tokenizer | `src/tokenizer.zig`, `src/bpe/` | corpus-trained byte-level BPE (vendored bpe.zig); char fallback for v1 |
 | transformer | `src/gpt.zig` | block wiring, KV-cached sampling; forward/backward by Fucina |
 | CLI | `src/main.zig` | `gen` / `train` / `infer` / `info` / `serve` |
 | server | `src/server.zig` | HTTP/1.1 API + embedded UI (SSE token stream) |
@@ -55,9 +41,9 @@ Requires **Zig 0.16.0**. The first build fetches Fucina 0.5.1 (MIT) from
 git clone https://github.com/vibezig/llm && cd llm
 
 zig build --release=fast        # build zig-out/bin/llm
-zig build test                  # 18 tests, incl. finite-difference gradient checks
+zig build test                  # 27 tests, incl. finite-difference gradient checks
 
-./zig-out/bin/llm gen           # create random tensors -> models/tiny.vzm
+./zig-out/bin/llm gen           # train a 1,024-token BPE, create models/tiny.vzm
 ./zig-out/bin/llm train         # train on data/input.txt (TinyShakespeare)
 ./zig-out/bin/llm infer --prompt "ROMEO:" --tokens 300
 ./zig-out/bin/llm serve         # then open http://localhost:8080
@@ -74,10 +60,10 @@ Nothing in the repo depends on a checkpoint being present.
 
 ```
 llm gen   [--out models/tiny.vzm] [--layers 3] [--heads 4] [--embd 96]
-          [--block 64] [--data data/input.txt] [--seed 1337]
+          [--block 64] [--data data/input.txt] [--vocab 1024] [--seed 1337]
 
 llm train [--data data/input.txt] [--out models/tiny.vzm] [--model in.vzm]
-          [--steps 12000] [--batch 8] [--lr 0.003] [--wd 0.01]
+          [--vocab 1024] [--steps 12000] [--batch 8] [--lr 0.003] [--wd 0.01]
           [--eval-every 500] [--sample-every 1000] [--seed 1337]
 
 llm infer [--model models/tiny.vzm] [--prompt "ROMEO:"] [--tokens 200]
@@ -87,21 +73,22 @@ llm serve [--model models/tiny.vzm] [--port 8080]
 llm info  [--model models/tiny.vzm]
 ```
 
-`gen` writes a fresh, randomly-initialised tensor model — the same file format
-`train` and `infer` use, so a checkpoint is just "tensors someone trained".
-`info` prints the config and the tensor registry:
+`gen` trains the BPE vocab, then writes a fresh, randomly-initialised tensor
+model — the same file format `train` and `infer` use, so a checkpoint is just
+"tokenizer + tensors someone trained". `info` prints the config and registry:
 
 ```
 model: models/tiny.vzm
-  params   345504
+  params   437568
   layers   3
   heads    4 (head dim 24)
   embd     96
   block    64
-  vocab    65
+  vocab    1024
+  tokenizer bpe
   tensors  34
   tensors:
-    wte                [65, 96]
+    wte                [1024, 96]
     wpe                [64, 96]
     h0.ln1.g           [96, 1]
     h0.attn.wq         [96, 96]
@@ -122,16 +109,30 @@ tokens ──► wte[idx] + wpe[pos]
     └─────────────────────────────┘
              │
              ▼
-        ln_f ──► logits = x @ wteᵀ ──► softmax ──► next byte
+        ln_f ──► logits = x @ wteᵀ ──► softmax ──► next token
 ```
 
-Default `tiny` config: 3 layers, 4 heads, 96 dims, 64-token context, 65-byte
-vocab → **345,504 parameters** (1.4 MB). Bigger shapes are one flag away:
+Default `tiny` config: 3 layers, 4 heads, 96 dims, 64-token context, a
+corpus-trained 1,024-token BPE → **437,568 parameters** (1.7 MB). Bigger shapes
+are one flag away:
 
 ```bash
 ./zig-out/bin/llm gen  --layers 6 --heads 6 --embd 192 --block 128 --out models/medium.vzm
 ./zig-out/bin/llm train --model models/medium.vzm --steps 20000 --batch 16
 ```
+
+### Tokenizer
+
+`src/bpe/` is a Zig 0.16 port of
+[alvarobartt/bpe.zig](https://github.com/alvarobartt/bpe.zig)
+(MIT OR Apache-2.0), with the POSIX-regex pre-tokenizer replaced by a pure-Zig
+implementation. `src/bpe/train.zig` adds a corpus-trained BPE: `llm gen` starts
+from the 256 byte tokens, greedily merges the most frequent pairs until
+`--vocab` (default 1,024), and stores the vocab + merge pairs in the `.vzm` v2
+blob. No downloaded tokenizer, no GPT-2 vocabulary.
+
+Version-1 checkpoints carry the old 65-byte char vocab and transparently use the
+char path.
 
 ### Autograd, not a hand-written tape
 
@@ -163,9 +164,9 @@ Adam moments live in Fucina's per-parameter state.
 | field | type | notes |
 | --- | --- | --- |
 | magic | 4 bytes | `"VZLM"` |
-| version | u32 | `1` |
+| version | u32 | `1` = char vocab, `2` = corpus-trained BPE blob |
 | n_layer, n_head, n_embd, block_size, vocab_size | 5 × u32 | model shape |
-| vocab_len, vocab | u32 + bytes | tokenizer is part of the model |
+| vocab_len, vocab | u32 + bytes | v1 byte->id table, v2 BPE vocab + merges |
 | n_tensors | u32 | registry length |
 | per tensor: name_len, name, rows, cols, dtype | u32, bytes, u32, u32, u32 | dtype `0` = f32 |
 | blob | `total_floats × f32` | row-major, little-endian |
@@ -233,23 +234,23 @@ kernels:
 
 | workload | throughput |
 | --- | --- |
-| training (345k params, batch 8 × seq 64) | ~22,200 tok/s |
-| inference, KV cache, 200-token context | ~11,900 tok/s |
+| BPE training on 1 MB (vocab 1,024) | **~0.5 s** |
+| encode / decode (1.1 MB corpus) | ~19 MB/s / ~46 MB/s |
+| training (437k params, batch 8 × seq 64) | ~20,300 tok/s |
+| inference, KV cache, 200-token context | ~7,100 tok/s |
 
-For reference, the hand-written kernels this replaced measured ~4,900 tok/s
-training and ~5,600 tok/s inference on the same machine. The loss trajectory is
-unchanged: both reach 2.53 after 200 smoke-test steps from the same seed.
-
-The same 12,000-step recipe on the 1 MB corpus reaches train loss 4.20 → 1.35
-and held-out val loss 1.78; wall-clock now depends on the host CPU and the BLAS
-provider Fucina auto-detects (`-Dblas=openblas` / `mkl` / `blis` are used when
-installed).
+A 500-step run takes the BPE model from loss 6.94 (random) to 4.30 and already
+produces readable fragments; 12k steps is the next benchmark. Throughput depends
+on the host CPU and the BLAS provider Fucina auto-detects (`-Dblas=openblas` /
+`mkl` / `blis` are used when installed).
 
 ## Limits (on purpose)
 
 This is a readable reference implementation, not a production inference stack:
 
-* **char-level tokenizer** — one token per byte; no BPE yet.
+* **encoder is O(L²) per piece** — it finds the next lowest-rank merge by
+  rescanning the piece. Fine for words and prompts, but long whitespace or
+  punctuation runs are quadratic; a rank-ordered linked list is the next win.
 * **f32 only** — no quantisation, no bf16/f16.
 * **one request at a time** — the server serialises generations behind the model.
 * **CPU only** — Fucina's Metal/CUDA GEMM offload is not enabled here.
@@ -264,9 +265,10 @@ Each of those is a contained piece of work; see `docs/ROADMAP.md`.
 zig build test
 ```
 
-18 tests: full-model gradients vs finite differences, backward determinism,
+27 tests: full-model gradients vs finite differences, backward determinism,
 "one AdamW step reduces loss", KV-cached decoding vs a full forward pass,
-sampling length/range, `.vzm` round-trip and corruption rejection, plus the CLI
+sampling length/range, BPE training + blob round-trip, optimized-vs-reference
+trainer parity, `.vzm` v1/v2 round-trips and corruption rejection, plus the CLI
 and server helpers.
 
 ## License
@@ -275,6 +277,10 @@ MIT. See `LICENSE`.
 
 ## Third-party
 
-[Fucina](https://github.com/matteo-grella/fucina) 0.5.1 is fetched by the Zig
-build and statically linked. It is MIT-licensed, copyright (c) 2026 Matteo
-Grella and the Fucina contributors; its license travels with the package.
+* [Fucina](https://github.com/matteo-grella/fucina) 0.5.1 is fetched by the Zig
+  build and statically linked. MIT, copyright (c) 2026 Matteo Grella and the
+  Fucina contributors.
+* [`src/bpe/`](src/bpe/) is a 0.16 port of
+  [alvarobartt/bpe.zig](https://github.com/alvarobartt/bpe.zig), MIT OR
+  Apache-2.0 (license files live beside the sources). `train.zig` is the
+  corpus-trained extension written for this project.

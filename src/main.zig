@@ -54,9 +54,9 @@ fn printHelp(out: *std.Io.Writer) !void {
         \\
         \\usage:
         \\  llm gen   [--out models/tiny.vzm] [--layers 3] [--heads 4] [--embd 96]
-        \\            [--block 64] [--data data/input.txt] [--seed 1337]
+        \\            [--block 64] [--data data/input.txt] [--vocab 1024] [--seed 1337]
         \\  llm train [--data data/input.txt] [--out models/tiny.vzm] [--model in.vzm]
-        \\            [--steps 3000] [--batch 8] [--lr 0.003] [--wd 0.01]
+        \\            [--vocab 1024] [--steps 3000] [--batch 8] [--lr 0.003] [--wd 0.01]
         \\            [--eval-every 100] [--sample-every 250] [--seed 1337]
         \\  llm infer [--model models/tiny.vzm] [--prompt "ROMEO:"] [--tokens 200]
         \\            [--temp 0.8] [--top-k 40] [--seed 0]
@@ -77,6 +77,7 @@ fn printHelp(out: *std.Io.Writer) !void {
 fn cmdGen(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Writer) !void {
     const data_path = flags.get("data") orelse default_data;
     const out_path = flags.get("out") orelse default_model;
+    const vocab_size = flags.getInt(usize, "vocab", tokenizer.default_vocab_size);
     const seed = flags.getInt(u64, "seed", 1337);
 
     const corpus = std.Io.Dir.cwd().readFileAlloc(io, data_path, gpa, .limited(64 << 20)) catch |e| {
@@ -85,18 +86,21 @@ fn cmdGen(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Writer)
     };
     defer gpa.free(corpus);
 
-    const vocab = try tokenizer.buildVocab(gpa, corpus);
-    defer gpa.free(vocab);
+    const blob = try tokenizer.train(gpa, corpus[0 .. corpus.len - corpus.len / 20], vocab_size);
+    defer gpa.free(blob);
+
+    var tk = try tokenizer.Tokenizer.initBpeFromBlob(gpa, blob);
+    errdefer tk.deinit();
 
     const cfg = model_mod.Config{
         .n_layer = flags.getInt(u32, "layers", 3),
         .n_head = flags.getInt(u32, "heads", 4),
         .n_embd = flags.getInt(u32, "embd", 96),
         .block_size = flags.getInt(u32, "block", 64),
-        .vocab_size = @intCast(vocab.len),
+        .vocab_size = @intCast(tk.vocabSize()),
     };
 
-    var m = try model_mod.Model.initRandom(gpa, cfg, vocab, seed);
+    var m = try model_mod.Model.initRandom(gpa, cfg, tk, blob, seed);
     defer m.deinit();
 
     try ensureDir(io, std.fs.path.dirname(out_path) orelse ".");
@@ -144,20 +148,23 @@ fn cmdTrain(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Write
     var m = if (flags.get("model")) |path|
         try model_mod.Model.load(gpa, io, path, 512 << 20)
     else blk: {
-        const vocab = try tokenizer.buildVocab(gpa, corpus);
-        defer gpa.free(vocab);
+        const vocab_size = flags.getInt(usize, "vocab", tokenizer.default_vocab_size);
+        const blob = try tokenizer.train(gpa, train_text, vocab_size);
+        defer gpa.free(blob);
+        var tk = try tokenizer.Tokenizer.initBpeFromBlob(gpa, blob);
+        errdefer tk.deinit();
         const cfg = model_mod.Config{
             .n_layer = flags.getInt(u32, "layers", 3),
             .n_head = flags.getInt(u32, "heads", 4),
             .n_embd = flags.getInt(u32, "embd", 96),
             .block_size = flags.getInt(u32, "block", 64),
-            .vocab_size = @intCast(vocab.len),
+            .vocab_size = @intCast(tk.vocabSize()),
         };
-        break :blk try model_mod.Model.initRandom(gpa, cfg, vocab, seed);
+        break :blk try model_mod.Model.initRandom(gpa, cfg, tk, blob, seed);
     };
     defer m.deinit();
 
-    const tk = tokenizer.Tokenizer.init(m.vocab);
+    const tk = &m.tokenizer;
     const T: usize = m.cfg.block_size;
 
     const train_ids = try tk.encode(gpa, train_text);
@@ -258,7 +265,7 @@ fn cmdInfer(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Write
 
     var m = try model_mod.Model.load(gpa, io, path, 512 << 20);
     defer m.deinit();
-    const tk = tokenizer.Tokenizer.init(m.vocab);
+    const tk = &m.tokenizer;
 
     var s = try gpt.Session.init(gpa, &m, 1);
     defer s.deinit();
@@ -272,7 +279,7 @@ fn cmdInfer(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Write
     try out.print("{s}", .{prompt});
     try out.flush();
 
-    var stream_ctx = StreamCtx{ .w = out, .vocab = m.vocab };
+    var stream_ctx = StreamCtx{ .w = out, .tokenizer = tk };
     const t0 = nowNs(io);
     const sink = gpt.TokenSink{ .ctx = @ptrCast(&stream_ctx), .emit = &emitToken };
     try s.generate(gpa, prompt_ids, n_tokens, .{ .temperature = temp, .top_k = top_k, .seed = seed }, sink, &ids);
@@ -286,17 +293,26 @@ fn cmdInfer(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Write
 
 const StreamCtx = struct {
     w: *std.Io.Writer,
-    vocab: []const u8,
+    tokenizer: *const tokenizer.Tokenizer,
 };
 
-/// Streams a token as its raw byte straight to the writer, no allocation.
+/// Streams one token's bytes straight to the writer, no allocation.
 fn emitToken(ctx: *anyopaque, token: u32) void {
     const sc: *StreamCtx = @ptrCast(@alignCast(ctx));
-    const b: u8 = if (token < sc.vocab.len) sc.vocab[token] else '?';
-    sc.w.writeByte(b) catch {};
+    var buf: [tokenizer.max_token_bytes]u8 = undefined;
+    const bytes = sc.tokenizer.decodeTokenInto(token, &buf) catch return;
+    sc.w.writeAll(bytes) catch {};
 }
 
-fn sampleInto(gpa: std.mem.Allocator, s: *gpt.Session, tk: tokenizer.Tokenizer, prompt: []const u8, n: usize, seed: u64, out: *std.Io.Writer) !void {
+fn sampleInto(
+    gpa: std.mem.Allocator,
+    s: *gpt.Session,
+    tk: *const tokenizer.Tokenizer,
+    prompt: []const u8,
+    n: usize,
+    seed: u64,
+    out: *std.Io.Writer,
+) !void {
     const prompt_ids = try tk.encode(gpa, prompt);
     defer gpa.free(prompt_ids);
     var ids: std.ArrayList(u32) = .empty;
@@ -316,8 +332,8 @@ fn cmdInfo(gpa: std.mem.Allocator, io: std.Io, flags: Flags, out: *std.Io.Writer
     defer m.deinit();
     const cfg = m.cfg;
     try out.print(
-        "model: {s}\n  params   {d}\n  layers   {d}\n  heads    {d} (head dim {d})\n  embd     {d}\n  block    {d}\n  vocab    {d}\n  tensors  {d}\n",
-        .{ path, m.paramCount(), cfg.n_layer, cfg.n_head, cfg.headDim(), cfg.n_embd, cfg.block_size, cfg.vocab_size, m.tensors.len },
+        "model: {s}\n  params   {d}\n  layers   {d}\n  heads    {d} (head dim {d})\n  embd     {d}\n  block    {d}\n  vocab    {d}\n  tokenizer {s}\n  tensors  {d}\n",
+        .{ path, m.paramCount(), cfg.n_layer, cfg.n_head, cfg.headDim(), cfg.n_embd, cfg.block_size, cfg.vocab_size, @tagName(m.tokenizer.kind()), m.tensors.len },
     );
     try out.writeAll("  tensors:\n");
     for (m.tensors) |t| {
@@ -386,7 +402,9 @@ test "flag parsing handles --k v and --k=v" {
 test "emitToken streams the token byte to the writer" {
     var out_buf: [64]u8 = undefined;
     var w = std.Io.Writer.fixed(&out_buf);
-    var ctx = StreamCtx{ .w = &w, .vocab = "abcde" };
+    var tk = try tokenizer.Tokenizer.initChar(std.testing.allocator, "abcde");
+    defer tk.deinit();
+    var ctx = StreamCtx{ .w = &w, .tokenizer = &tk };
     const sink = gpt.TokenSink{ .ctx = @ptrCast(&ctx), .emit = &emitToken };
     sink.send(2);
     sink.send(1);

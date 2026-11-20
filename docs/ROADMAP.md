@@ -19,27 +19,34 @@ measuring the providers:
 3. **Quantized weights** — Fucina has q8_0/q4_K block-quantized RHS kernels. A
    second dtype in `.vzm` (`dtype = 1`) plus the loader would shrink the
    checkpoint and speed up the memory-bound decode shapes.
-4. **Larger models** — the current 345k-parameter model fits in L2; the next
+4. **Larger models** — the current BPE model is 437k parameters; the next
    meaningful speed test is a model whose weights stream from RAM.
 
 ## Model quality
 
-5. **BPE tokenizer** — 4k merges trained on the corpus, stored in the checkpoint
-   (the `vocab` field becomes a merge table + version bump to `.vzm` v2). At
-   equal parameter count this is worth far more than char-level.
-6. **Multi-file corpus loader** — walk a directory, concatenate with document
+5. **BPE blob cache** — `gen` retrains the tokenizer on every run (~0.5 s at
+   vocab 1,024). Persist the blob and reuse it when the corpus/vocab are
+   unchanged.
+6. **Encoder linked-list merges** — merging still rescans the piece for the
+   lowest-rank pair (O(L²)). A rank-ordered linked list would help long
+   whitespace/punctuation runs; short words are already fast.
+7. **Chat/instruction format** — `/v1/chat/completions` wraps messages in
+   `user:`/`assistant:`, a format the raw-text model never saw. Either pass the
+   last user message through raw for this model, or fine-tune on a role-tagged
+   corpus.
+8. **Multi-file corpus loader** — walk a directory, concatenate with document
    separators, shuffle document order per epoch.
-7. **Checkpoint resume** — Fucina's AdamW can `saveState`/`loadState`; persist
+9. **Checkpoint resume** — Fucina's AdamW can `saveState`/`loadState`; persist
    that next to the weights so a 12k-step run can be interrupted without a cold
    start.
-8. **Dropout + faster LR schedules** — trivially useful once the model grows
-   past ~10M parameters where overfitting starts to bite.
+10. **Dropout + faster LR schedules** — trivially useful once the model grows
+    past ~10M parameters where overfitting starts to bite.
 
 ## Engineering
 
-9. **Concurrent server** — a worker thread per connection with a session pool
-   instead of the current serial accept loop, plus a mutex per session.
-10. **Graceful shutdown + `SIGINT`** — needed to run under a supervisor.
-11. **HTTP keep-alive and `Content-Length` on the streaming route** — lets
+11. **Concurrent server** — a worker thread per connection with a session pool
+    instead of the current serial accept loop, plus a mutex per session.
+12. **Graceful shutdown + `SIGINT`** — needed to run under a supervisor.
+13. **HTTP keep-alive and `Content-Length` on the streaming route** — lets
     reverse proxies (nginx, Cloudflare) buffer predictably.
-12. **`llm export --format gguf`** — interop with the wider tooling ecosystem.
+14. **`llm export --format gguf`** — interop with the wider tooling ecosystem.

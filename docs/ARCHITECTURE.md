@@ -19,6 +19,11 @@ longer share the blob's layout. Adding a tensor means adding it to
 `buildRegistry`, to `LayerOffsets`, and to `Session.registerParams`; the
 registry test asserts offsets stay contiguous.
 
+The checkpoint also carries the tokenizer bytes (`vocab_len`/`vocab`): a raw
+byte->id table for v1 char models, or the compact BPE vocab+merge blob for v2.
+`Model` parses it into a `Tokenizer` at load time, so a checkpoint is
+self-contained. Both versions remain readable.
+
 `Session` is heap-allocated because Fucina pins an `ExecContext` after `init`
 (the embedded allocator points at itself) and the optimizer retains pointers to
 the parameter fields. Moving a `Session` value would invalidate both.
@@ -42,8 +47,13 @@ version are pinned in `build.zig.zon`.
 
 ## 3. Forward pass
 
-Tokens and positions are gathered into a `[batch*seq, model]` stream (row
-`r = b*T + t`). Per layer:
+Tokens come from the model's tokenizer: a byte-level BPE trained on the corpus
+(`src/bpe/`, using bpe.zig's encoder and a pure-Zig trainer), or the legacy char
+path for v1 checkpoints. The trainer is incremental — symbols are a doubly
+linked list, each adjacent pair has an intrusive position list, and a max-heap
+selects the next merge — so a merge touches only that pair's occurrences
+(1 MB / vocab 1,024 trains in ~0.5 s). Tokens and positions are gathered into a
+`[batch*seq, model]` stream (row `r = b*T + t`). Per layer:
 
 ```
 x  := LN1(x)
@@ -88,7 +98,9 @@ This repository no longer implements VJPs. It guards the model **wiring** with:
 cache, then each new token costs a single-row forward over borrowed zero-copy
 cache views: O(T) attention per token instead of O(T²). When the context fills,
 the newest half is kept and replayed. Temperature scaling and top-k sampling are
-unchanged.
+unchanged. Because byte-level BPE tokens can split a UTF-8 sequence, the CLI and
+server decode each token to bytes and the server feeds those bytes through the
+existing streaming UTF-8 repair before emitting SSE.
 
 ## 6. HTTP layer
 

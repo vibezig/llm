@@ -10,22 +10,22 @@
 //! `.vzm` layout (little-endian):
 //!
 //!   magic       4 bytes  "VZLM"
-//!   version     u32      1
+//!   version     u32      1 = char vocab, 2 = corpus-trained BPE blob
 //!   n_layer     u32
 //!   n_head      u32
 //!   n_embd      u32
 //!   block_size  u32
 //!   vocab_size  u32
-//!   vocab_len   u32      number of bytes following
-//!   vocab       [vocab_len]u8
+//!   vocab_len   u32      number of tokenizer bytes following
+//!   vocab       [vocab_len]u8   (# v1: byte->id table, # v2: BPE blob)
 //!   n_tensors   u32
 //!   repeated n_tensors times:
 //!       name_len u32, name [name_len]u8, rows u32, cols u32, dtype u32(0 = f32)
 //!   blob        [total_floats]f32
 const std = @import("std");
+const tokenizer_mod = @import("tokenizer.zig");
 
 pub const magic = "VZLM";
-pub const version: u32 = 1;
 
 pub const Config = struct {
     n_layer: u32 = 3,
@@ -88,29 +88,42 @@ pub const Layout = struct {
 pub const Model = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
+    tokenizer: tokenizer_mod.Tokenizer,
     vocab: []u8,
     tensors: []TensorInfo,
     blob: []f32,
     layout: Layout,
 
-    pub fn initRandom(allocator: std.mem.Allocator, cfg: Config, vocab: []const u8, seed: u64) !Model {
+    /// Takes ownership of `tokenizer` on success. On error the caller still
+    /// owns it; `tokenizer_blob` is copied.
+    pub fn initRandom(
+        allocator: std.mem.Allocator,
+        cfg: Config,
+        tokenizer: tokenizer_mod.Tokenizer,
+        tokenizer_blob: []const u8,
+        seed: u64,
+    ) !Model {
         try cfg.validate();
-        if (vocab.len != cfg.vocab_size) return error.VocabSizeMismatch;
+        if (tokenizer.vocabSize() != cfg.vocab_size) return error.VocabSizeMismatch;
 
         const tensors = try buildRegistry(allocator, cfg);
         errdefer freeRegistry(allocator, tensors);
         const layout = try resolveLayout(allocator, cfg, tensors);
+        errdefer allocator.free(layout.layers);
 
         var total: usize = 0;
         for (tensors) |t| total += t.len();
         const blob = try allocator.alloc(f32, total);
+        errdefer allocator.free(blob);
         @memset(blob, 0);
 
-        const vocab_copy = try allocator.dupe(u8, vocab);
+        const vocab_copy = try allocator.dupe(u8, tokenizer_blob);
+        errdefer allocator.free(vocab_copy);
 
         var m = Model{
             .allocator = allocator,
             .cfg = cfg,
+            .tokenizer = tokenizer,
             .vocab = vocab_copy,
             .tensors = tensors,
             .blob = blob,
@@ -121,10 +134,18 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Model) void {
+        self.tokenizer.deinit();
         self.allocator.free(self.blob);
         self.allocator.free(self.vocab);
         self.allocator.free(self.layout.layers);
         freeRegistry(self.allocator, self.tensors);
+    }
+
+    /// Convenience for legacy char-vocab models and tests.
+    pub fn initRandomChar(allocator: std.mem.Allocator, cfg: Config, vocab: []const u8, seed: u64) !Model {
+        var tk = try tokenizer_mod.Tokenizer.initChar(allocator, vocab);
+        errdefer tk.deinit();
+        return Model.initRandom(allocator, cfg, tk, vocab, seed);
     }
 
     /// Scaled normal init, GPT-2 style: residual projections get a smaller std
@@ -187,7 +208,7 @@ pub const Model = struct {
         errdefer out.deinit(allocator);
 
         try out.appendSlice(allocator, magic);
-        try appendU32(&out, allocator, version);
+        try appendU32(&out, allocator, self.tokenizer.version());
         try appendU32(&out, allocator, self.cfg.n_layer);
         try appendU32(&out, allocator, self.cfg.n_head);
         try appendU32(&out, allocator, self.cfg.n_embd);
@@ -231,7 +252,7 @@ pub const Model = struct {
         const got_magic = try rd.take(4);
         if (!std.mem.eql(u8, got_magic, magic)) return error.BadMagic;
         const ver = try rd.u32le();
-        if (ver != version) return error.UnsupportedVersion;
+        if (ver != 1 and ver != 2) return error.UnsupportedVersion;
 
         var cfg = Config{
             .n_layer = try rd.u32le(),
@@ -243,8 +264,10 @@ pub const Model = struct {
         try cfg.validate();
 
         const vocab_len = try rd.u32le();
-        if (vocab_len != cfg.vocab_size) return error.VocabSizeMismatch;
         const vocab = try rd.take(vocab_len);
+        var tokenizer = try tokenizer_mod.Tokenizer.fromSerialized(allocator, ver, vocab);
+        errdefer tokenizer.deinit();
+        if (tokenizer.vocabSize() != cfg.vocab_size) return error.VocabSizeMismatch;
 
         const n_tensors = try rd.u32le();
         const tensors = try allocator.alloc(TensorInfo, n_tensors);
@@ -277,15 +300,19 @@ pub const Model = struct {
 
         const blob_bytes = try rd.take(total * @sizeOf(f32));
         const blob = try allocator.alloc(f32, total);
+        errdefer allocator.free(blob);
         @memcpy(std.mem.sliceAsBytes(blob), blob_bytes);
 
         const vocab_copy = try allocator.dupe(u8, vocab);
+        errdefer allocator.free(vocab_copy);
         // Registry from the file must match the canonical layout; resolve by name.
         const layout = try resolveLayout(allocator, cfg, tensors);
+        errdefer allocator.free(layout.layers);
 
         return Model{
             .allocator = allocator,
             .cfg = cfg,
+            .tokenizer = tokenizer,
             .vocab = vocab_copy,
             .tensors = tensors,
             .blob = blob,
@@ -456,7 +483,7 @@ test "checkpoint round-trip preserves config, vocab and weights" {
 
     const cfg = Config{ .n_layer = 2, .n_head = 2, .n_embd = 16, .block_size = 8, .vocab_size = 10 };
     const vocab = "abcdefghij";
-    var m = try Model.initRandom(allocator, cfg, vocab, 1234);
+    var m = try Model.initRandomChar(allocator, cfg, vocab, 1234);
     defer m.deinit();
 
     const bytes = try m.serialize(allocator);
@@ -468,8 +495,33 @@ test "checkpoint round-trip preserves config, vocab and weights" {
     try testing.expectEqual(cfg.n_layer, loaded.cfg.n_layer);
     try testing.expectEqual(cfg.n_embd, loaded.cfg.n_embd);
     try testing.expectEqualStrings(vocab, loaded.vocab);
+    try testing.expectEqual(tokenizer_mod.Tokenizer.Kind.char, loaded.tokenizer.kind());
     try testing.expectEqualSlices(f32, m.blob, loaded.blob);
     try testing.expectEqual(m.layout.layers[1].proj, loaded.layout.layers[1].proj);
+}
+
+test "BPE checkpoint round-trip (format v2)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const bpe_train = @import("bpe/train.zig");
+    const blob = try bpe_train.train(allocator, "abab abab abab\n", 258);
+    defer allocator.free(blob);
+
+    const tk = try tokenizer_mod.Tokenizer.initBpeFromBlob(allocator, blob);
+    const cfg = Config{ .n_layer = 1, .n_head = 1, .n_embd = 8, .block_size = 4, .vocab_size = @intCast(tk.vocabSize()) };
+    var m = try Model.initRandom(allocator, cfg, tk, blob, 9);
+    defer m.deinit();
+
+    const bytes = try m.serialize(allocator);
+    defer allocator.free(bytes);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[4..8], .little));
+
+    var loaded = try Model.deserialize(allocator, bytes);
+    defer loaded.deinit();
+    try testing.expectEqual(tokenizer_mod.Tokenizer.Kind.bpe, loaded.tokenizer.kind());
+    try testing.expectEqual(cfg.vocab_size, loaded.tokenizer.vocabSize());
 }
 
 test "deserialize rejects a corrupted magic" {
@@ -478,7 +530,7 @@ test "deserialize rejects a corrupted magic" {
     const allocator = gpa.allocator();
 
     const cfg = Config{ .n_layer = 1, .n_head = 1, .n_embd = 8, .block_size = 4, .vocab_size = 4 };
-    var m = try Model.initRandom(allocator, cfg, "abcd", 7);
+    var m = try Model.initRandomChar(allocator, cfg, "abcd", 7);
     defer m.deinit();
     const bytes = try m.serialize(allocator);
     defer allocator.free(bytes);

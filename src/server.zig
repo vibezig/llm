@@ -188,7 +188,7 @@ fn handleCompletion(self: Conn, req: *std.http.Server.Request, mode: Mode) !void
         return sendError(req, .bad_request, msg, "invalid_request_error");
     };
 
-    const tk = tokenizer.Tokenizer.init(self.model.vocab);
+    const tk = &self.model.tokenizer;
     const ids_in = try tk.encode(arena, prompt);
     if (ids_in.len == 0) return sendError(req, .bad_request, "empty prompt", "invalid_request_error");
 
@@ -306,7 +306,9 @@ fn fullCompletion(self: Conn, req: *std.http.Server.Request, mode: Mode, params:
         return sendError(req, .internal_server_error, @errorName(e), "server_error");
     };
 
-    const text = try decodeBytes(self.gpa, self.model.vocab, ids.items);
+    const raw = try self.model.tokenizer.decode(self.gpa, ids.items);
+    defer self.gpa.free(raw);
+    const text = try utf8Lossy(self.gpa, raw);
     defer self.gpa.free(text);
 
     const created = nowSeconds(self.io);
@@ -355,7 +357,7 @@ fn streamCompletion(self: Conn, req: *std.http.Server.Request, mode: Mode, param
     var sse = SseOut.init(w, params.model, mode, nowSeconds(self.io));
     try sse.emitRole();
 
-    var ctx = StreamCtx{ .sse = &sse, .vocab = self.model.vocab };
+    var ctx = StreamCtx{ .sse = &sse, .tokenizer = &self.model.tokenizer };
     const sink = gpt.TokenSink{ .ctx = @ptrCast(&ctx), .emit = &StreamCtx.emit };
 
     var ids: std.ArrayList(u32) = .empty;
@@ -445,16 +447,22 @@ const SseOut = struct {
 
 const StreamCtx = struct {
     sse: *SseOut,
-    vocab: []const u8,
+    tokenizer: *const tokenizer.Tokenizer,
     pending: [4]u8 = undefined,
     len: u8 = 0,
     need: u8 = 0,
 
     fn emit(ctx: *anyopaque, token: u32) void {
         const self: *StreamCtx = @ptrCast(@alignCast(ctx));
-        const b: u8 = if (token < self.vocab.len) self.vocab[token] else '?';
+        var buf: [tokenizer.max_token_bytes]u8 = undefined;
+        const bytes = self.tokenizer.decodeTokenInto(token, &buf) catch {
+            self.sse.emitContent("\xEF\xBF\xBD") catch {};
+            return;
+        };
         var out: [4]u8 = undefined;
-        if (self.feed(b, &out)) |seq| self.sse.emitContent(seq) catch {};
+        for (bytes) |b| {
+            if (self.feed(b, &out)) |seq| self.sse.emitContent(seq) catch {};
+        }
     }
 
     fn feed(self: *StreamCtx, b: u8, out: *[4]u8) ?[]const u8 {
@@ -534,15 +542,18 @@ fn escapeByte(buf: *[8]u8, b: u8) []const u8 {
     };
 }
 
-fn decodeBytes(gpa: std.mem.Allocator, vocab: []const u8, ids: []const u32) ![]u8 {
+/// Make decoded token bytes safe to embed in a JSON string. Invalid UTF-8
+/// sequences become U+FFFD, matching the streaming path's repair.
+fn utf8Lossy(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    if (std.unicode.utf8ValidateSlice(bytes)) return gpa.dupe(u8, bytes);
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     const repl = "\xEF\xBF\xBD";
     var pend: [4]u8 = undefined;
     var len: u8 = 0;
     var need: u8 = 0;
-    for (ids) |id| {
-        const b: u8 = if (id < vocab.len) vocab[id] else '?';
+    for (bytes) |b| {
         if (need == 0) {
             if (b < 0x80) {
                 try out.append(gpa, b);
