@@ -38,6 +38,41 @@ pub const SampleParams = struct {
     seed: u64 = 0,
 };
 
+/// Per-layer key/value cache for autoregressive decoding.
+///
+/// K and V for already-seen positions never change, so decoding a new token only
+/// computes one row of q/k/v and attends over the cache: O(T) instead of O(T²)
+/// per token.
+pub const KvCache = struct {
+    k: [][]f32,
+    v: [][]f32,
+    pos: usize = 0,
+    max_seq: usize,
+
+    pub fn init(allocator: std.mem.Allocator, cfg: model_mod.Config) !KvCache {
+        const L: usize = cfg.n_layer;
+        const len: usize = cfg.block_size * cfg.n_embd;
+        const k = try layerBufs(allocator, L, len);
+        errdefer {
+            for (k) |b| allocator.free(b);
+            allocator.free(k);
+        }
+        const v = try layerBufs(allocator, L, len);
+        return .{ .k = k, .v = v, .pos = 0, .max_seq = cfg.block_size };
+    }
+
+    pub fn deinit(self: *KvCache, allocator: std.mem.Allocator) void {
+        for (self.k) |b| allocator.free(b);
+        allocator.free(self.k);
+        for (self.v) |b| allocator.free(b);
+        allocator.free(self.v);
+    }
+
+    pub fn reset(self: *KvCache) void {
+        self.pos = 0;
+    }
+};
+
 /// Callback invoked for every generated token (for streaming UIs / CLI echo).
 pub const TokenSink = struct {
     ctx: *anyopaque,
@@ -305,6 +340,98 @@ pub const Session = struct {
         return loss / @as(f32, @floatFromInt(BT));
     }
 
+    /// Run `tokens` through the model and fill the KV cache with their keys and
+    /// values, so the next `forwardStep` only has to look at one new token.
+    /// Requires a batch-1 session.
+    pub fn forwardPrefill(self: *Session, cache: *KvCache, tokens: []const u32, T: usize) void {
+        std.debug.assert(self.batch == 1);
+        std.debug.assert(T <= cache.max_seq);
+        self.forward(tokens, T);
+        const C: usize = self.model.cfg.n_embd;
+        for (0..self.model.cfg.n_layer) |l| {
+            @memcpy(cache.k[l][0 .. T * C], self.k[l][0 .. T * C]);
+            @memcpy(cache.v[l][0 .. T * C], self.v[l][0 .. T * C]);
+        }
+        cache.pos = T;
+    }
+
+    /// Decode a single new token at position `pos` (== cache.pos), reading keys
+    /// and values out of `cache`. Writes the next-token logits into
+    /// `self.logits[0..vocab]`.
+    pub fn forwardStep(self: *Session, cache: *KvCache, token: u32, pos: usize) void {
+        const model = self.model;
+        const cfg = model.cfg;
+        const C: usize = cfg.n_embd;
+        const H: usize = cfg.n_head;
+        const hd: usize = cfg.headDim();
+        const V: usize = cfg.vocab_size;
+        const M: usize = cfg.mlpDim();
+        const L: usize = cfg.n_layer;
+        std.debug.assert(self.batch == 1);
+        std.debug.assert(pos < cache.max_seq);
+
+        const p = model.blob;
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+        const x = self.x[0..C];
+
+        // embedding for this single position
+        std.debug.assert(token < V);
+        @memcpy(x, p[model.layout.wte + @as(usize, token) * C ..][0..C]);
+        const prow = p[model.layout.wpe + pos * C ..][0..C];
+        for (x, prow) |*xv, pv| xv.* += pv;
+
+        for (0..L) |l| {
+            const lo = model.layout.layers[l];
+            const ln1 = self.ln1y[l][0..C];
+            tensor.layerNorm(x, p[lo.ln1g..][0..C], p[lo.ln1b..][0..C], ln1, self.ln1mean[l][0..1], self.ln1rstd[l][0..1], 1, C);
+
+            const qrow = self.q[l][0..C];
+            const krow = self.k[l][0..C];
+            const vrow = self.v[l][0..C];
+            tensor.matmul(1, C, C, ln1, p[lo.wq..][0 .. C * C], qrow);
+            tensor.matmul(1, C, C, ln1, p[lo.wk..][0 .. C * C], krow);
+            tensor.matmul(1, C, C, ln1, p[lo.wv..][0 .. C * C], vrow);
+            @memcpy(cache.k[l][pos * C ..][0..C], krow);
+            @memcpy(cache.v[l][pos * C ..][0..C], vrow);
+
+            const ctxrow = self.ctx[l][0..C];
+            for (0..H) |h| {
+                const off = h * hd;
+                const qv = qrow[off..][0..hd];
+                const scores = self.tmp_t[0 .. pos + 1];
+                for (0..pos + 1) |t| {
+                    const kv = cache.k[l][t * C + off ..][0..hd];
+                    scores[t] = tensor.dot(qv, kv) * scale;
+                }
+                tensor.softmax(scores);
+                const cv = ctxrow[off..][0..hd];
+                @memset(cv, 0);
+                for (0..pos + 1) |t| {
+                    const vv = cache.v[l][t * C + off ..][0..hd];
+                    const w = scores[t];
+                    for (cv, vv) |*c, val| c.* += w * val;
+                }
+            }
+
+            tensor.matmul(1, C, C, ctxrow, p[lo.wo..][0 .. C * C], self.s1[0..C]);
+            for (x, self.s1[0..C]) |*xv, sv| xv.* += sv;
+
+            const ln2 = self.ln2y[l][0..C];
+            tensor.layerNorm(x, p[lo.ln2g..][0..C], p[lo.ln2b..][0..C], ln2, self.ln2mean[l][0..1], self.ln2rstd[l][0..1], 1, C);
+            const hrow = self.h2[l][0..M];
+            tensor.matmul(1, M, C, ln2, p[lo.fc..][0 .. C * M], hrow);
+            tensor.geluInPlace(hrow);
+            tensor.matmul(1, C, M, hrow, p[lo.proj..][0 .. M * C], self.s1[0..C]);
+            for (x, self.s1[0..C]) |*xv, sv| xv.* += sv;
+        }
+
+        const lnf = self.lnfy[0..C];
+        tensor.layerNorm(x, p[model.layout.lnfg..][0..C], p[model.layout.lnfb..][0..C], lnf, self.lnfmean[0..1], self.lnfrstd[0..1], 1, C);
+        tensor.matmulNt(1, V, C, lnf, p[model.layout.wte..][0 .. V * C], self.logits[0..V]);
+
+        cache.pos = pos + 1;
+    }
+
     // -- backward -----------------------------------------------------------
 
     pub fn zeroGrads(self: *Session) void {
@@ -531,9 +658,11 @@ pub const Session = struct {
 
     // -- sampling -----------------------------------------------------------
 
-    /// Autoregressive generation. `prompt` must be non-empty and no longer than
-    /// the model's block size. Tokens are streamed to `sink` as they are chosen
-    /// and also appended to `out`.
+    /// Autoregressive generation with a KV cache.
+    ///
+    /// The prompt is prefilled in one batched pass, then each new token costs a
+    /// single-row forward over the cached keys/values. When the context fills up
+    /// the newest half is kept and prefilled again.
     pub fn generate(
         self: *Session,
         allocator: std.mem.Allocator,
@@ -550,36 +679,48 @@ pub const Session = struct {
         if (prompt.len == 0) return error.EmptyPrompt;
 
         var rng = std.Random.DefaultPrng.init(params.seed);
+        var cache = try KvCache.init(allocator, cfg);
+        defer cache.deinit(allocator);
 
-        var ctx_buf = try allocator.alloc(u32, block);
+        const ctx_buf = try allocator.alloc(u32, block);
         defer allocator.free(ctx_buf);
         const cand = try allocator.alloc(f32, V);
         defer allocator.free(cand);
         const order = try allocator.alloc(u32, V);
         defer allocator.free(order);
 
-        const window: []const u32 = prompt[prompt.len - @min(prompt.len, block) ..];
-        @memcpy(ctx_buf[0..window.len], window);
-        var ctx_len: usize = window.len;
+        // prefill the tail of the prompt
+        const pre_len = @min(prompt.len, block);
+        @memcpy(ctx_buf[0..pre_len], prompt[prompt.len - pre_len ..]);
+        var ctx_len: usize = pre_len;
+        self.forwardPrefill(&cache, ctx_buf[0..ctx_len], ctx_len);
+        var logits_row = self.logits[(ctx_len - 1) * V ..][0..V];
 
         for (0..max_new_tokens) |_| {
-            // If the context is full, slide the window (naive, no KV cache).
-            if (ctx_len >= block) {
-                const keep = block - 1;
+            if (cache.pos >= block) {
+                // context full: keep the newest half, re-prefill, positions restart
+                const keep = @max(block / 2, 1);
                 std.mem.copyForwards(u32, ctx_buf[0..keep], ctx_buf[ctx_len - keep .. ctx_len]);
                 ctx_len = keep;
+                cache.reset();
+                self.forwardPrefill(&cache, ctx_buf[0..ctx_len], ctx_len);
+                logits_row = self.logits[(ctx_len - 1) * V ..][0..V];
             }
-            self.forward(ctx_buf[0..ctx_len], ctx_len);
-            const row = self.logits[(ctx_len - 1) * V ..][0..V];
 
-            @memcpy(cand, row);
-            for (cand) |*v| v.* = v.* / @max(params.temperature, 1e-5);
+            @memcpy(cand, logits_row);
+            const inv_temp = 1.0 / @max(params.temperature, 1e-5);
+            for (cand) |*v| v.* *= inv_temp;
             const next = pickToken(&rng, cand, order, params.top_k);
 
             ctx_buf[ctx_len] = next;
             ctx_len += 1;
             try out.append(allocator, next);
             if (sink) |s| s.send(next);
+
+            if (cache.pos < block) {
+                self.forwardStep(&cache, next, cache.pos);
+                logits_row = self.logits[0..V];
+            }
         }
     }
 
@@ -765,6 +906,46 @@ test "one optimisation step reduces the loss" {
     }
     const after = s.lossOnly(&tokens, &targets, 8);
     try testing.expect(after < before);
+}
+
+test "cached decoding matches a full forward pass (greedy)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const cfg = model_mod.Config{ .n_layer = 2, .n_head = 2, .n_embd = 16, .block_size = 16, .vocab_size = 8 };
+    var m = try Model.initRandom(allocator, cfg, "abcdefgh", 21);
+    defer m.deinit();
+    var s = try Session.init(allocator, &m, 1);
+    defer s.deinit();
+
+    const prompt = [_]u32{ 1, 2, 3, 4, 5 };
+    const n_new = 10;
+
+    // cached path (what the CLI and server use)
+    var cached: std.ArrayList(u32) = .empty;
+    defer cached.deinit(allocator);
+    try s.generate(allocator, &prompt, n_new, .{ .temperature = 0.0, .top_k = 0, .seed = 1 }, null, &cached);
+    try testing.expectEqual(@as(usize, n_new), cached.items.len);
+
+    // reference path: re-run the whole context for every token
+    var ctx: std.ArrayList(u32) = .empty;
+    defer ctx.deinit(allocator);
+    try ctx.appendSlice(allocator, &prompt);
+    var reference: std.ArrayList(u32) = .empty;
+    defer reference.deinit(allocator);
+    for (0..n_new) |_| {
+        s.forward(ctx.items, ctx.items.len);
+        const row = s.logits[(ctx.items.len - 1) * cfg.vocab_size ..][0..cfg.vocab_size];
+        var best: u32 = 0;
+        for (row, 0..) |v, i| {
+            if (v > row[best]) best = @intCast(i);
+        }
+        try reference.append(allocator, best);
+        try ctx.append(allocator, best);
+    }
+
+    try testing.expectEqualSlices(u32, reference.items, cached.items);
 }
 
 test "generate streams the requested number of tokens" {

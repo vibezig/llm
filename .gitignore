@@ -1,7 +1,6 @@
 .zig-cache/
 zig-out/
-# trained checkpoints: the shipped tiny model is committed, ad-hoc runs are not
-models/*.vzm
-!models/tiny.vzm
+# trained checkpoints are outputs, never tracked: `llm gen` / `llm train` create them
+models/
 *.log
 .DS_Store

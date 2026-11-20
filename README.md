@@ -13,6 +13,24 @@ $ llm infer --prompt "ROMEO:"    # sample text, streaming
 $ llm serve                      # http://localhost:8080 — chat UI + JSON API
 ```
 
+Real output from a 12,000-step checkpoint (`--temp 0.8 --top-k 40`):
+
+```
+ROMEO:
+Ah, all the come of your son,
+As are is my such comes repent.
+
+ESCALUS:
+Hill I father, they dareless the crown:
+I am do tell me such for the gold friend:
+'Tis't I'll say to her hath dead wash of this advise,
+So to Julie
+```
+
+It is a 345k-parameter model trained for 12,000 steps on a 1 MB corpus — it
+learned the *shape* of Shakespeare (names, line breaks, verse rhythm, real words),
+not the meaning of it.
+
 ---
 
 ## What's in here
@@ -44,8 +62,11 @@ zig build test                  # 24 tests, incl. finite-difference gradient che
 ```
 
 `zig build` alone gives you a debug binary; `--release=fast` is what you want for
-training. The repo ships a small already-trained `models/tiny.vzm` so `infer` and
-`serve` work straight after cloning.
+training.
+
+**Models are build outputs, not repo contents.** `models/` is git-ignored: `llm gen`
+writes a fresh random tensor model, `llm train` replaces it with a trained one.
+Nothing in the repo depends on a checkpoint being present.
 
 ## CLI
 
@@ -193,8 +214,12 @@ SIMD intrinsics beyond what Zig/LLVM vectorises:
 
 | workload | throughput |
 | --- | --- |
-| training (345k params, batch 8 × seq 64) | ~1,900 tok/s (~1.1 GFLOP/step) |
-| inference (same model, no KV cache) | ~650 tok/s |
+| training (345k params, batch 8 × seq 64) | 1,906 tok/s (~1.1 GFLOP/step) |
+| inference, short context | ~650 tok/s |
+| inference, 200 tokens of context | ~160 tok/s (full recompute, no KV cache) |
+
+That checkpoint is 12,000 steps = 6.1M tokens ≈ 5.5 epochs in **54 minutes**
+(same box): train loss 4.20 → 1.35, held-out val loss **1.78**.
 
 The GEMM kernels are 4×8 register-blocked: four rows of `A` share one vector of
 `B`, which cuts `B` traffic 4× and keeps the FMA loop in registers. That alone
