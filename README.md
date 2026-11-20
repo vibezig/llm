@@ -198,13 +198,31 @@ curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' \
   -d '{"messages":[{"role":"user","content":"ROMEO:"}],"max_tokens":64}'
 ```
 
-```python
-from openai import OpenAI
-c = OpenAI()  # reads OPENAI_BASE_URL / OPENAI_API_KEY
-r = c.chat.completions.create(model="vibezig-llm",
-                              messages=[{"role": "user", "content": "ROMEO:"}],
-                              max_tokens=64)
-print(r.choices[0].message.content)
+Bun one-liner against the same endpoint (top-level `await` works):
+
+```bash
+bun -e '
+const j = await fetch("http://localhost:8080/v1/chat/completions", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({
+    model: "vibezig-llm",
+    messages: [{ role: "user", content: "ROMEO:" }],
+    max_tokens: 64,
+  }),
+}).then((r) => r.json());
+console.log(j.choices[0].message.content);
+'
+```
+
+Or with the official package (`bun add openai`):
+
+```bash
+bun -e 'import OpenAI from "openai";
+const c = new OpenAI();  // reads OPENAI_BASE_URL / OPENAI_API_KEY
+const r = await c.chat.completions.create({ model: "vibezig-llm",
+  messages: [{ role: "user", content: "ROMEO:" }], max_tokens: 64 });
+console.log(r.choices[0].message.content);'
 ```
 
 ## Performance
