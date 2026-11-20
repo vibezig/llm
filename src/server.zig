@@ -440,7 +440,7 @@ const SseOut = struct {
     }
 
     fn emitDone(self: *SseOut) !void {
-        try self.w.writeAll("data\n\n");
+        try self.w.writeAll(DONE); try self.w.writeByte(10); try self.w.writeByte(10);
         try self.w.flush();
     }
 };
@@ -570,4 +570,25 @@ fn sendError(req: *std.http.Server.Request, status: std.http.Status, msg: []cons
 
 fn methodNotAllowed(req: *std.http.Server.Request) !void {
     return sendError(req, .method_not_allowed, "method not allowed", "invalid_request_error");
+}
+const DONE = "data: " ++ "[" ++ "DONE" ++ "]";
+
+test "parseBody reads messages and max_tokens" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var p = Params{};
+    try parseBody(arena.allocator(), "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8}", &p);
+    try std.testing.expectEqual(@as(usize, 8), p.max_tokens);
+    try std.testing.expectEqual(@as(usize, 1), p.messages.len);
+    try std.testing.expectEqualStrings("hi", p.messages[0].content);
+}
+
+test "buildPrompt renders the chat template" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const msgs = [_]Msg{.{ .role = "user", .content = "hi" }};
+    var p = Params{ .messages = &msgs };
+    const out = try buildPrompt(arena.allocator(), &p, .chat);
+    try std.testing.expect(std.mem.startsWith(u8, out, "user: hi"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "assistant:"));
 }

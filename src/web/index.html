@@ -185,7 +185,7 @@ function setChips(info) {
   ].map(([k, v]) => `<span class="chip">${k} <b>${v}</b></span>`).join("");
 }
 
-fetch("/api/model").then(r => r.json()).then(setChips).catch(() => {
+fetch("/v1/models/vibezig-llm").then(r => r.json()).then(j => setChips(j.meta)).catch(() => {
   $("chips").innerHTML = `<span class="chip err">model unavailable</span>`;
 });
 
@@ -238,33 +238,44 @@ function generate() {
   const started = performance.now();
   const decoder = new TextDecoder("utf-8");
   let count = 0;
-  source = new EventSource("/api/stream?" + q.toString());
-  source.onmessage = (ev) => {
-    const d = JSON.parse(ev.data);
-    if (d.event === "done") {
-      const secs = (performance.now() - started) / 1000;
-      $("stat").innerHTML = `<b>${count}</b> tokens · <b>${(count / Math.max(secs, 0.001)).toFixed(1)}</b> tok/s · <b>${secs.toFixed(2)}</b>s`;
-      stop();
-      return;
-    }
-    if (d.event === "error") {
-      body.insertAdjacentText("beforeend", "");
-      $("stat").innerHTML = `<span class="err">error: ${d.error}</span>`;
-      stop();
-      return;
-    }
-    if (typeof d.b === "number") {
-      // tokens are bytes: decode as a stream so UTF-8 sequences survive
-      body.textContent += decoder.decode(new Uint8Array([d.b]), { stream: true });
-      count++;
-      caret.remove();
-      out.append(caret);
-    }
-  };
-  source.onerror = () => {
-    if (count === 0) $("stat").innerHTML = `<span class="err">stream closed</span>`;
+  const NL = String.fromCharCode(10), SEP = NL + NL;
+  const ctrl = new AbortController();
+  source = { close: () => ctrl.abort() };
+  function finish() {
+    const secs = (performance.now() - started) / 1000;
+    $("stat").innerHTML = `<b>${count}</b> tokens · <b>${(count / Math.max(secs, 0.001)).toFixed(1)}</b> tok/s`;
     stop();
-  };
+  }
+  (async () => {
+    const res = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      signal: ctrl.signal,
+      body: JSON.stringify({ model: "vibezig-llm", stream: true,
+        max_tokens: +$("tokens").value, temperature: +$("temp").value,
+        top_k: +$("topk").value, seed: +$("seed").value,
+        messages: [{ role: "user", content: prompt }] }),
+    });
+    const reader = res.body.getReader();
+    let buf = "";
+    for (;;) {
+      const r = await reader.read();
+      if (r.done) break;
+      buf += decoder.decode(r.value, { stream: true });
+      let i;
+      while ((i = buf.indexOf(SEP)) >= 0) {
+        const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+        for (const line of chunk.split(NL)) {
+          if (!line.startsWith("data: ")) continue;
+          const payload = line.slice(6);
+          let d; try { d = JSON.parse(payload); } catch (e) { finish(); return; }
+          const t = d.choices && d.choices[0] && d.choices[0].delta;
+          if (t && t.content) { body.textContent += t.content; count++; caret.remove(); out.append(caret); }
+        }
+      }
+    }
+    finish();
+  })().catch(() => {});
 }
 
 $("go").addEventListener("click", generate);
